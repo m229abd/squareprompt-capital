@@ -1,1 +1,107 @@
-# squareprompt-capital
+# Squareprompt Capital
+
+A Docker-hosted research lab for discovering cryptocurrency and tokenized-asset trading pipelines on Hyperliquid. It combines an annealed stochastic Monte Carlo tree search, versioned Jupyter notebooks, developer/critic/researcher agents, and durable Temporal workflows with a React + shadcn/ui interface.
+
+This release runs research campaigns and scheduled research refreshes. **It does not submit live orders.** The baseline is a runnable, causal momentum pipeline. Sandbox campaigns use explicitly synthetic data and deterministic agent edits; live-data campaigns use the configured provider and real exchange data. Sandbox results are never represented as investment performance.
+
+## Start
+
+Only Docker Engine/Desktop and Compose v2.20+ are required. No host Python, Node, Jupyter, Temporal, or database setup is needed.
+
+```bash
+docker compose up --build -d
+```
+
+Open [the research workspace](http://localhost:3000). Start a **Sandbox research** campaign to exercise the entire workflow without credentials. For live-data research, open **Settings**, enter the OpenAI-compatible provider base URL and API key, then **Save & discover models**. Choose exact exchange market IDs in the campaign wizard. Fees, current funding, spread, historical candles and historical funding provenance are fetched automatically. Review the execution-cost snapshot before launch; its fee, hourly funding rate and spread stay fixed for the entire campaign. No signing key is used or required.
+
+The local service ports deliberately avoid common existing research installations:
+
+| Service | URL |
+| --- | --- |
+| Workspace | http://localhost:3000 |
+| API and OpenAPI | http://localhost:8100/docs |
+| Temporal UI | http://localhost:8082 |
+| MLflow | http://localhost:5000 |
+| TensorBoard | http://localhost:6007 |
+| Opik (optional Docker profile) | http://localhost:5174 |
+
+Start the bundled self-hosted Opik stack when you need LLM traces:
+
+```bash
+docker compose --profile opik up -d
+```
+
+Opik uses the official 1.11.14 Compose infrastructure adapted for trace collection, without its privileged Python execution service. Its MySQL, ClickHouse, Redis, ZooKeeper, and MinIO services have their own persistent volumes. Allow several additional GB of RAM. If Opik is offline, every LLM input/output stays in the local call ledger and durable outbox until it can be delivered. The core stack needs approximately 2–4 GB; the complete observability stack needs more. All host ports bind to loopback.
+
+### Interrupted campaigns
+
+Power loss or a worker restart preserves Temporal history, research state, dataset snapshots, and notebooks. Run `docker compose up -d` again. Transient network/provider failures retry with exponential backoff. Permanent configuration errors surface as **Needs attention**; fix the issue and press **Resume**. **Pause** takes effect at a durable step boundary, after in-flight work finishes. **Finish search** freezes the best evaluated notebook and runs the reserved holdout. It does not destroy history.
+
+To stop containers while retaining research, use `docker compose stop` or `docker compose down`. Removing Docker volumes deletes research state. Back up the named research and Temporal volumes together with `notebook-history/` for consistent recovery.
+
+## Campaign configuration
+
+The interface uses a blue spruce palette. The wizard is ordered **Research brief → Markets & agents → Compute & data → Review & launch**.
+
+- Select listed Hyperliquid markets by search or exact ID, including HIP-3 and spot IDs. Both sandbox and live modes fetch the exchange catalog when the wizard opens; no market options or initial selections are hardcoded.
+- Select Developer, Researcher and Critic models and reasoning efforts separately. Configure the provider in Settings, then fetch its model catalog in the wizard. Role choices can be remembered as defaults.
+- **0 means unlimited** for USD, tokens, total evaluation seconds, experiment count, critic retries and refresh-run count. A zero target duration uses all available development data. Docker CPU/RAM containment and trading risk constraints remain in force. With every search ceiling disabled, finish or pause manually; annealing uses only enabled ceilings.
+- Set target evaluation time before evaluation data. Untouched history defaults adapt using the latest measured pilot when available; manual data choices remain intact. Each new campaign still measures its own baseline.
+- Review latest fetched taker fees, hourly funding, bid/ask and full spread. Launch pins that exact snapshot across all nodes and the final holdout. Refresh schedules fetch new snapshots per campaign.
+- A finite USD budget requires verified pricing for each chosen role model. With USD set to 0, models without pricing can run; unknown dollar costs are displayed as unknown while tokens are still tracked.
+
+## What is implemented
+
+- Twelve exact category branches immediately below the baseline, with per-category notebook edit scopes.
+- Tree descent using epsilon-greedy UCT. Exploration is `max(0, 1 − max(USD fraction, token fraction, evaluation-time fraction, experiment fraction))`: 1 is uniform exploration; 0 is greedy UCT selection. Unvisited branches are selected uniformly.
+- Each reward is **child objective − its evaluated hypothesis parent's objective**; reward and visits backpropagate along hypothesis ancestry. Gains remain signed.
+- Objectives: annualized Sharpe, net income after fees/funding/slippage, or return minus twice maximum drawdown. The Pareto set maximizes return and Sharpe while minimizing drawdown.
+- A developer → deterministic checks → critic → evaluation → researcher loop. Critic feedback drives configurable repair attempts. Developer and researcher have bounded public internet search/reference tools; source downloads use a managed point-in-time JSON gateway.
+- On a new best score, evaluated semantic-merge nodes are queued for the other current Pareto members. Live mode uses the same LLM/critic/evaluation loop. Unexplored hypotheses inherit the latest evaluated champion's notebook at selection, with that inheritance recorded separately from hypothesis ancestry.
+- A real Jupyter kernel executes every candidate before chronological replay. Each function receives completed historical prefixes only. All external observations are filtered by `available_at`. The runner has no dataset volume, provider credentials, Docker socket, or external network route.
+- Immutable chronological final holdout, an embargo, winner selection persisted before holdout access, and idempotent holdout results. Holdout metrics never enter selection, reward, hypothesis generation, or the Pareto set.
+- A short baseline replay measures fixed startup overhead and per-bar compute cost. The application sizes a shared scoring window to the requested target duration. That target is not a cutoff: slower models can finish, and their runtime updates scheduling estimates. Only the remaining total campaign compute allocation imposes a hard deadline.
+- Hard admission limits for LLM USD, tokens, evaluation wall time, experiments, critic retries, and final-holdout reservation. Ambiguous provider failures retain their maximum reservation; retries reserve again because a provider may have billed an unacknowledged call. Known usage settles a reservation down to actual cost.
+- An outer Git repository for the application and a separate ignored inner Git repository at `notebook-history/.git`. Every draft, rejection, execution failure, and evaluated notebook is retained. Per-campaign/node refs and real two-parent Git merge commits preserve provenance. Git is written with Dulwich; host Git is not needed at runtime.
+- TensorBoard metrics and state transitions per node; MLflow runs, artifacts, model versions, and a `research-winner` alias; Opik traces plus a local searchable call ledger and durable telemetry delivery.
+- Finite Temporal-based interval refresh schedules with explicit total cost envelopes, pause/resume/stop, new datasets per interval, and new versions in the same research registry. No automatically enabled spending schedule.
+- Interactive tree pan/zoom, fit, minimap, collapse/expand, status/reward labels, node inspection and notebook download; campaign history; data cache; artifact registry; provider discovery and budgets.
+
+See the [verification record](docs/verification.md) for executed checks and remaining integration limits.
+
+## Important implementation boundaries
+
+This is a research application, not a production execution system. See [architecture and research assumptions](docs/architecture.md) for the precise evaluation contract and limitations.
+
+- Hyperliquid's market catalog is discovered at runtime. ETC is never silently changed to ETH. Wrapped spot assets and HIP-3 names remain explicit, such as `@107` and `xyz:TSLA`. An unavailable ticker cannot be evaluated.
+- Spot supports long/flat. Shorting uses perps. The current evaluator caps gross exposure at 1× and uses independent equal-capital market sleeves. Cross-asset historical prefixes are available to notebook stages, but a joint portfolio optimizer, margin engine, liquidation simulator, and live broker are not implemented.
+- USDC-denominated spot and USDC-collateral perpetuals are supported. Non-USDC quote/collateral markets are blocked until quote conversion and aligned-asset fee semantics can be verified. HIP-3 fees use discovered deployer scale and growth mode; unknown metadata blocks evaluation.
+- Candles are limited to the exchange's recent snapshot history (up to 4,900 requested bars here). There is no built-in paid historical archive or historical order-book reconstruction. Current fee tiers and the observed current half-spread are held constant across a replay, with the reviewed hourly funding rate held constant. Historical funding is retained as dataset provenance; old campaigns without a snapshot retain their historical-funding convention. They are labeled execution assumptions, not historical facts.
+- The OpenAI-compatible `/models` standard does not require prices or reasoning levels. Advertised metadata is retained. If reasoning levels are missing, the editable field suggests none, minimal, low, medium, high, xhigh and max without claiming provider support. Custom effort strings are passed through unchanged; a blank field uses the provider default. Missing prices require explicit verified pricing before a USD-budgeted campaign can start. The application never invents supported reasoning levels.
+- Notebook imports are deliberately restricted to numerical libraries. Additional sources must be public HTTPS JSON arrays with numeric `time`, `available_at`, and `value` fields (Unix milliseconds). CSV archives, arbitrary Python packages, authenticated data vendors, and arbitrary notebook formats need additional adapters.
+- Source publication timestamps are declared by their upstream provider. The application validates and enforces them; it cannot prove historical availability independently. AST checks and an LLM critic are useful checks, not a mathematical proof of no leakage or a security boundary for hostile multi-tenant Python.
+- End-to-end live agent quality and provider billing semantics require your provider credentials. Synthetic tests cannot validate trading profitability. Repeated development-set search introduces selection bias; the final holdout is an estimate, not a guarantee.
+
+## Development and verification in Docker
+
+```bash
+docker compose run --rm --no-deps api python -m pytest -q
+# Run a complete synthetic campaign and verify its final holdout:
+docker compose exec -T api python < scripts/smoke.py
+# Frontend checks run as part of its Docker build:
+docker compose build web
+```
+
+A baseline can be imported in the campaign wizard if it retains the stable contract and twelve category cell IDs. The bundled example is [`notebooks/baseline.ipynb`](notebooks/baseline.ipynb). Configure provider keys in the UI; do not commit secrets. `.env` is ignored. An optional `BRAVE_SEARCH_API_KEY` selects Brave search; public RSS search is the key-free fallback.
+
+On hosts with broken Docker DNS, set `CONTAINER_DNS` in `.env` to a working DNS server. Build-network overrides are optional; default builds use standard Docker networking. A Linux host-network build can be run explicitly:
+
+```bash
+docker buildx build --allow network.host --network host \
+  -t squareprompt-capital-python:local -f backend/Dockerfile --load .
+docker buildx build --allow network.host --network host \
+  -t squareprompt-capital-web:local -f frontend/Dockerfile --load frontend
+docker compose up -d --no-build
+```
+
+`PIP_INDEX_URL` is an optional backend build argument for an approved package mirror. All application processes, builds, notebook kernels, tests, and observability services run in Docker.

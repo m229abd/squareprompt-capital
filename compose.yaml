@@ -1,0 +1,129 @@
+name: squareprompt-capital
+include:
+  - deploy/opik/compose.yaml
+x-app: &app
+  build:
+    context: .
+    dockerfile: backend/Dockerfile
+  image: squareprompt-capital-python:local
+  restart: unless-stopped
+  mem_limit: 512m
+  cpus: 1
+  dns: ["${CONTAINER_DNS:-1.1.1.1}"]
+  volumes:
+    - research:/data
+    - ./notebook-history:/data/notebooks
+  environment: &environment
+    DATA_DIR: /data
+    TEMPORAL_ADDRESS: temporal:7233
+    RUNNER_URL: http://runner:8001
+    MLFLOW_TRACKING_URI: http://mlflow:5000
+    OPIK_URL_OVERRIDE: http://opik-backend:8080
+    OPIK_WORKSPACE: default
+    GIT_PYTHON_REFRESH: quiet
+    OPENBLAS_NUM_THREADS: "1"
+    OMP_NUM_THREADS: "1"
+    MKL_NUM_THREADS: "1"
+    BRAVE_SEARCH_API_KEY: ${BRAVE_SEARCH_API_KEY:-}
+  depends_on:
+    storage-init: {condition: service_completed_successfully}
+  networks: [default, evaluation]
+services:
+  storage-init:
+    image: squareprompt-capital-python:local
+    user: root
+    network_mode: none
+    mem_limit: 64m
+    cpus: 0.25
+    volumes:
+      - research:/data
+      - ./notebook-history:/data/notebooks
+    entrypoint: [sh, -c, 'mkdir -p /data/notebooks && chown 1000:1000 /data /data/notebooks']
+  web:
+    image: squareprompt-capital-web:local
+    build:
+      context: ./frontend
+    restart: unless-stopped
+    ports: ['127.0.0.1:3000:80']
+    depends_on: [api]
+  api:
+    <<: *app
+    ports: ['127.0.0.1:8100:8000']
+    depends_on:
+      temporal: {condition: service_started}
+      storage-init: {condition: service_completed_successfully}
+  worker:
+    <<: *app
+    command: ['python', '-m', 'app.worker']
+    depends_on:
+      temporal: {condition: service_started}
+      runner: {condition: service_started}
+      mlflow: {condition: service_started}
+      storage-init: {condition: service_completed_successfully}
+  runner:
+    image: squareprompt-capital-python:local
+    command: ['uvicorn', 'app.runner:app', '--host', '0.0.0.0', '--port', '8001']
+    restart: unless-stopped
+    networks: [evaluation]
+    environment:
+      OPENBLAS_NUM_THREADS: '1'
+      OMP_NUM_THREADS: '1'
+    read_only: true
+    tmpfs: ['/tmp:rw,size=768m,mode=1777', '/home/researcher:rw,size=128m,uid=1000,gid=1000']
+    cap_drop: [ALL]
+    security_opt: ['no-new-privileges:true']
+    mem_limit: 1g
+    cpus: 1
+    pids_limit: 128
+  postgres:
+    mem_limit: 256m
+    cpus: 1
+    image: postgres:16.9-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-local-research-only}
+      POSTGRES_USER: temporal
+    volumes: ['temporal-db:/var/lib/postgresql/data']
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U temporal']
+      interval: 5s
+      timeout: 5s
+      retries: 20
+  temporal:
+    mem_limit: 512m
+    cpus: 1
+    image: temporalio/auto-setup:1.25.2
+    restart: unless-stopped
+    environment:
+      GOMEMLIMIT: 384MiB
+      DB: postgres12
+      DB_PORT: 5432
+      POSTGRES_USER: temporal
+      POSTGRES_PWD: ${POSTGRES_PASSWORD:-local-research-only}
+      POSTGRES_SEEDS: postgres
+    depends_on:
+      postgres: {condition: service_healthy}
+  temporal-ui:
+    image: temporalio/ui:2.34.0
+    restart: unless-stopped
+    environment:
+      TEMPORAL_ADDRESS: temporal:7233
+      TEMPORAL_CORS_ORIGINS: http://localhost:3000
+    ports: ['127.0.0.1:8082:8080']
+    depends_on: [temporal]
+  mlflow:
+    <<: *app
+    command: ['mlflow', 'server', '--host', '0.0.0.0', '--port', '5000', '--workers', '1', '--backend-store-uri', 'sqlite:////data/mlflow.db', '--serve-artifacts', '--artifacts-destination', '/data/mlartifacts']
+    ports: ['127.0.0.1:5000:5000']
+    networks: [default]
+  tensorboard:
+    <<: *app
+    command: ['tensorboard', '--logdir', '/data/tensorboard', '--host', '0.0.0.0', '--port', '6006']
+    ports: ['127.0.0.1:6007:6006']
+    networks: [default]
+volumes:
+  research:
+  temporal-db:
+networks:
+  evaluation:
+    internal: true

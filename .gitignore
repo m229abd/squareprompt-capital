@@ -218,3 +218,13 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Persisted runtime state belongs to Docker volumes and the inner notebook repository.
+notebook-history/
+runtime/
+frontend/node_modules/
+frontend/dist/
+
+frontend/*.tsbuildinfo
+
+.build-cache/
