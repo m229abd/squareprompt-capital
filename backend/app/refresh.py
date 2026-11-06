@@ -2,7 +2,9 @@ import json
 import time
 import uuid
 from temporalio import activity
-from . import engine, history, notebooks, store
+from temporalio.exceptions import ApplicationError
+from . import engine, history, notebooks, provider, store
+from .constants import uses_llm
 
 @activity.defn(name='create_refresh')
 async def create_refresh(payload:dict)->str:
@@ -13,6 +15,8 @@ async def create_refresh(payload:dict)->str:
     except KeyError:
         pass
     parent=store.load(payload['parent'])
+    if not uses_llm(parent['config']):
+        raise ApplicationError(provider.LEGACY_CAMPAIGN_MESSAGE,type='ConfigurationError',non_retryable=True)
     winner=engine.getnode(parent,parent['selected'])
     nb=notebooks.read(parent['id'],winner['notebook'])
     name=notebooks.fingerprint(nb)[:16]+'.ipynb'

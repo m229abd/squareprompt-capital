@@ -9,6 +9,7 @@ class CampaignConfig(BaseModel):
     name: str = Field(default='Untitled research campaign', min_length=1, max_length=120)
     prompt: str = Field(min_length=10, max_length=20000)
     mode: Literal['demo','live'] = 'demo'
+    agent_mode: Literal['llm'] = 'llm'
     markets: list[str] = Field(min_length=1, max_length=200)
     market_type: Literal['perp','spot','both'] = 'perp'
     direction: Literal['both','long','short'] = 'both'

@@ -1,11 +1,17 @@
 """Run inside the API container: python /app/scripts/smoke.py (or via Compose exec stdin)."""
 import json
+import os
 import time
 import httpx
 
 with httpx.Client(base_url='http://localhost:8000/api',timeout=30) as client:
-    created=client.post('/campaigns',json={'name':'Cross-market momentum discovery','prompt':'Find robust momentum with realistic costs and volatility-aware risk. This is a synthetic end-to-end workflow verification.','mode':'demo','markets':['BTC','SOL','HYPE'],'bars':480,'max_nodes':16,'evaluation_seconds':20,'evaluation_budget_seconds':600})
-    created.raise_for_status()
+    settings=client.get('/provider').raise_for_status().json()
+    agents=settings.get('default_agents',{})
+    if not settings.get('has_key') or any(not agents.get(role,{}).get('model') for role in ('developer','researcher','critic')):
+        raise SystemExit('Configure your provider and use Remember role choices in the campaign wizard before running this smoke test.')
+    created=client.post('/campaigns',json={'name':'Cross-market momentum discovery','prompt':'Find robust momentum with realistic costs and volatility-aware risk. This is a synthetic end-to-end workflow verification.','mode':'demo','agents':agents,'llm_budget_usd':float(os.getenv('SMOKE_LLM_BUDGET_USD','10')),'markets':['BTC','SOL','HYPE'],'bars':480,'max_nodes':2,'evaluation_seconds':20,'evaluation_budget_seconds':600})
+    if not created.is_success:
+        raise SystemExit(f'Campaign could not launch ({created.status_code}). {created.json().get("detail")}')
     cid=created.json()['id']
     print('Campaign:',cid,flush=True)
     prior=None

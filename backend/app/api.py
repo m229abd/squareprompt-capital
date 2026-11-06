@@ -13,7 +13,7 @@ from fastapi.responses import JSONResponse, Response
 from temporalio.client import Client
 from temporalio.exceptions import WorkflowAlreadyStartedError
 from . import engine, history, notebooks, provider, search, store
-from .constants import CATEGORIES
+from .constants import CATEGORIES, uses_llm
 from .market import discover
 from .schemas import CampaignConfig, ProviderConfig, RefreshScheduleRequest
 from .workflows import CampaignWorkflow, RefreshWorkflow
@@ -160,17 +160,16 @@ def campaigns():
 
 @app.post('/api/campaigns',status_code=201)
 async def create_campaign(config:CampaignConfig):
-    if config.mode=='live':
-        cfg=store.settings()
-        try:
-            provider.validate_agents(config.model_dump(),cfg)
-        except ValueError as exc:
-            raise HTTPException(422,str(exc))
+    settings=config.model_dump()
+    try:
+        provider.validate_agents(settings,store.settings())
+    except ValueError as exc:
+        raise HTTPException(422,str(exc))
     if config.execution_snapshot_id:
         from .market import load_execution_snapshot
-        try: load_execution_snapshot(config.execution_snapshot_id,config.model_dump())
+        try: load_execution_snapshot(config.execution_snapshot_id,settings)
         except ValueError as exc: raise HTTPException(422,str(exc))
-    c=engine.create(config.model_dump())
+    c=engine.create(settings)
     # The durable dispatch reconciler recovers an API crash between database write and workflow start.
     try:
         await asyncio.wait_for(dispatch(c['id']),timeout=5)
@@ -228,6 +227,8 @@ async def control(cid:str,action:str):
     c=require(cid)
     if c['status'] in {'completed','stopped'}:
         raise HTTPException(409,'Completed campaigns are immutable. Start a new campaign for further research.')
+    if action=='resume' and not uses_llm(c['config']):
+        raise HTTPException(409,provider.LEGACY_CAMPAIGN_MESSAGE)
     client=await temporal()
     handle=client.get_workflow_handle('campaign-'+cid)
     with store.transaction() as db:
@@ -369,6 +370,10 @@ async def schedule_refresh(body:RefreshScheduleRequest):
     parent=require(body.campaign)
     if parent['status']!='completed' or not parent['selected']:
         raise HTTPException(422,'Complete the initial campaign before scheduling interval research refreshes.')
+    try:
+        provider.validate_agents(parent['config'],store.settings())
+    except ValueError as exc:
+        raise HTTPException(422,str(exc))
     interval=body.interval_hours;runs=body.max_runs
     sid=uuid.uuid4().hex[:12]
     schedule={'history_version':2,'id':sid,'campaign':parent['id'],'interval_hours':interval,'max_runs':runs,'completed_runs':0,'campaigns':[],'status':'active','next_at':time.time()+interval*3600,'reserved_llm_ceiling':parent['config']['llm_budget_usd']*runs or None,'reserved_eval_ceiling':parent['config']['evaluation_budget_seconds']*runs or None}

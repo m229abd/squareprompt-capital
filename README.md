@@ -2,7 +2,7 @@
 
 A Docker-hosted research lab for discovering cryptocurrency and tokenized-asset trading pipelines on Hyperliquid. It combines an annealed stochastic Monte Carlo tree search, versioned Jupyter notebooks, developer/critic/researcher agents, and durable Temporal workflows with a React + shadcn/ui interface.
 
-This release runs research campaigns and scheduled research refreshes. **It does not submit live orders.** The baseline is a causal ridge-regression pipeline with ten OHLCV features, cost-aware signals, volatility sizing and retraining every 14 elapsed market days. Sandbox campaigns use explicitly synthetic data and deterministic agent edits; live-data campaigns use the configured provider and real exchange data. Sandbox results are never represented as investment performance.
+This release runs research campaigns and scheduled research refreshes. **It does not submit live orders.** The baseline is a causal ridge-regression pipeline with ten OHLCV features, cost-aware signals, volatility sizing and retraining every 14 elapsed market days. Campaigns can use either synthetic data or Hyperliquid data. Both data sources use LLM agents.
 
 ![Squareprompt Capital research workspace showing the hypothesis search tree and development performance chart](docs/research-workspace-screenshot.png)
 
@@ -14,7 +14,7 @@ Only Docker Engine/Desktop and Compose v2.20+ are required. No host Python, Node
 docker compose up --build -d
 ```
 
-Open [the research workspace](http://localhost:3000). Start a **Sandbox research** campaign to exercise the entire workflow without credentials. For live-data research, open **Settings**, enter the OpenAI-compatible provider base URL and API key, then **Save & discover models**. Choose exact exchange market IDs in the campaign wizard. Fees, current funding, spread, historical candles and historical funding provenance are fetched automatically. Review the execution-cost snapshot before launch; its fee, hourly funding rate and spread stay fixed for the entire campaign. No signing key is used or required.
+Open [the research workspace](http://localhost:3000). To run LLM agents, open **Settings**, enter the OpenAI-compatible provider base URL and API key, then **Save & discover models**. Choose a model for each role in the campaign wizard. The initializer uses the Researcher model unless you select a separate one. Provider calls start after baseline evaluation and appear in the Opik **squareprompt-capital** project. Choose exact exchange market IDs in the campaign wizard. Fees, current funding, spread, historical candles and historical funding provenance are fetched automatically. Review the execution-cost snapshot before launch; its fee, hourly funding rate and spread stay fixed for the entire campaign. No signing key is used or required.
 
 The local service ports deliberately avoid common existing research installations:
 
@@ -59,7 +59,7 @@ The interface uses a blue spruce palette. The wizard is ordered **Research brief
 - Each reward is **child objective − its evaluated hypothesis parent's objective**; reward and visits backpropagate along hypothesis ancestry. Gains remain signed.
 - Objectives: annualized Sharpe, net income after fees/funding/slippage, or return minus twice maximum drawdown. The Pareto set maximizes return and Sharpe while minimizing drawdown.
 - A developer → deterministic checks → critic → evaluation → researcher loop. Critic feedback drives configurable repair attempts. Developer and researcher have bounded public internet search/reference tools; source downloads use a managed point-in-time JSON gateway.
-- On a new best score, evaluated semantic-merge nodes are queued for the other current Pareto members. Live mode uses the same LLM/critic/evaluation loop. Initial live hypotheses can inherit the latest champion. Researcher follow-ups choose a child, a sibling, or no proposal. A child starts from the evaluated node; a sibling starts from its comparison parent. Those inputs stay pinned, and additional improvements enter through explicit merge experiments.
+- On a new best score, evaluated semantic-merge nodes are queued for the other current Pareto members. LLM campaigns use the same developer, critic and evaluation loop for merges. Initial LLM hypotheses can inherit the latest champion. Researcher follow-ups choose a child, a sibling, or no proposal. A child starts from the evaluated node; a sibling starts from its comparison parent. Those inputs stay pinned, and additional improvements enter through explicit merge experiments.
 - A real Jupyter kernel executes every candidate before chronological replay. Each function receives completed historical prefixes only. All external observations are filtered by `available_at`. The runner has no dataset volume, provider credentials, Docker socket, or external network route.
 - Immutable chronological final holdout, an embargo, winner selection persisted before holdout access, and idempotent holdout results. Holdout metrics never enter selection, reward, hypothesis generation, or the Pareto set.
 - A short baseline replay measures fixed startup overhead and per-bar compute cost. The application sizes a shared scoring window to the requested target duration. That target is not a cutoff: slower models can finish, and their runtime updates scheduling estimates. Only the remaining total campaign compute allocation imposes a hard deadline.
@@ -88,11 +88,13 @@ This is a research application, not a production execution system. See [architec
 
 ```bash
 docker compose run --rm --no-deps api python -m pytest -q
-# Run a complete synthetic campaign and verify its final holdout:
+# Run a synthetic-data campaign with your saved role models and verify its final holdout:
 docker compose exec -T api python < scripts/smoke.py
 # Frontend checks run as part of its Docker build:
 docker compose build web
 ```
+
+The smoke test makes provider calls. It uses a $10 ceiling by default and accepts an explicit override through `SMOKE_LLM_BUDGET_USD`.
 
 A baseline can be imported in the campaign wizard if it retains the stable contract and twelve category cell IDs. The bundled example is [`notebooks/baseline.ipynb`](notebooks/baseline.ipynb). Configure provider keys in the UI; do not commit secrets. `.env` is ignored. An optional `BRAVE_SEARCH_API_KEY` selects Brave search; public RSS search is the key-free fallback.
 

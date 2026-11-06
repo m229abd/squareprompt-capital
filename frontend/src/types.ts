@@ -5,6 +5,9 @@ export type ResearchNode={id:string;parent:string|null;category:string|null;summ
 export type Campaign={execution_costs?:ExecutionSnapshot;llm_cost_known?:boolean;id:string;name:string;created_at:number;config:Record<string,any>;status:string;phase:string;nodes:ResearchNode[];active_node:string|null;temperature:number;selection?:{node:string;temperature:number;mode:'search'|'merge'};llm_spent:number;tokens_spent:number;evaluation_spent:number;explored:number;pareto:string[];best:string|null;selected:string|null;holdout:{node:string;metrics:Metrics;curve:Curve[];assumptions:string[]}|null;error:string|null;calibration:{bars_per_second:number;evaluation_bars:number;estimated_evaluation_seconds?:number;startup_seconds?:number}|null;model_version:{name:string;version:string}|null;final_reason:string|null};
 export type Dataset={id:string;market:{id:string;symbol:string;type:string};bytes:number;start:number;end:number;provenance:{synthetic?:boolean;sha256:string}};
 export type Overview={campaigns:Campaign[];events:{id:number;campaign:string;time:number;kind:string;message:string}[];datasets:Dataset[];telemetry:{id:string;sent:number;error:string|null}[];categories:{id:string;name:string;description:string}[]};
+export function usesLlm(config:Campaign['config']){
+ return (config.agent_mode??(config.mode==='live'?'llm':undefined))==='llm';
+}
 export class ApiError extends Error {constructor(message:string,public status:number){super(message);}}
 export async function api<T=any>(path:string,options?:RequestInit):Promise<T>{const r=await fetch('/api'+path,{...options,headers:{'Content-Type':'application/json',...options?.headers}});if(!r.ok){const data=await r.json().catch(()=>({detail:r.statusText}));throw new ApiError(typeof data.detail==='string'?data.detail:JSON.stringify(data.detail),r.status);}return r.json();}
 export const money=(v:number)=>new Intl.NumberFormat('en-US',{style:'currency',currency:'USD',maximumFractionDigits:2}).format(v);
