@@ -1,5 +1,7 @@
 """Bounded research summaries for Temporal payloads and heartbeat details."""
 
+from .constants import uses_llm
+
 PHASES=('prepare','calibrate','baseline','seed','select','develop','critic','evaluate','research','finalize')
 LIMITS=('llm_budget_usd','llm_token_budget','evaluation_budget_seconds','evaluation_seconds','max_nodes','critic_retries')
 METRICS=('bars','return','net_income','max_drawdown','sharpe','fees','funding','elapsed_seconds','model_fit_count')
@@ -39,9 +41,11 @@ def checkpoint(campaign):
 def campaign_input(campaign):
     config=campaign['config']
     context=pick(config,('mode','market_type','direction','objective','interval','bars','holdout_fraction','baseline'))
+    if uses_llm(config):
+        context['agent_mode']='llm'
     context.update(id=campaign['id'],name=campaign['name'],markets=config['markets'],limits=pick(config,LIMITS))
     agents={role:pick(choice,('model','reasoning')) for role,choice in config.get('agents',{}).items() if choice.get('model')}
-    if agents:
+    if agents and context.get('agent_mode')=='llm':
         context['agents']=agents
     return {'history_version':2,'campaign':context,'checkpoint':checkpoint(campaign)}
 

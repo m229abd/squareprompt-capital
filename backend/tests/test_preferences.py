@@ -2,7 +2,7 @@ import copy
 import json
 from pathlib import Path
 import pytest
-from app import engine,store,notebooks,provider,market,search
+from app import engine,store,notebooks,provider,market,search,history
 from app.schemas import CampaignConfig
 from app.compute import calibrate
 from fastapi.testclient import TestClient
@@ -14,6 +14,73 @@ def sandbox(tmp_path,monkeypatch):
     return TestClient(app)
 
 def cfg(**kw):return CampaignConfig(prompt='Investigate configurable market research.',**{'markets':['BTC','SOL','HYPE'],**kw}).model_dump()
+
+def test_synthetic_llm_campaign_requires_a_provider(sandbox,monkeypatch):
+    monkeypatch.setattr(store,'settings',lambda:{})
+    payload=cfg()
+    del payload['agent_mode']
+    response=sandbox.post('/api/campaigns',json=payload)
+    assert response.status_code==422
+    assert 'provider API key' in response.json()['detail']
+
+@pytest.mark.asyncio
+async def test_legacy_campaigns_cannot_start_provider_calls(sandbox):
+    config=cfg(model='previously-selected-model')
+    response=sandbox.post('/api/campaigns',json={**config,'agent_mode':'deterministic'})
+    assert response.status_code==422
+    c=engine.create(config)
+    del c['config']['agent_mode']
+    c.update(status='paused',phase='critic')
+    with store.transaction() as db:
+        store.save(c,db)
+    assert sandbox.get('/api/campaigns/'+c['id']).status_code==200
+    assert sandbox.post('/api/campaigns/'+c['id']+'/resume').status_code==409
+    with pytest.raises(ValueError,match='Start a new campaign with provider models'):
+        await provider.call(c['id'],'old-review','critic',{})
+
+
+@pytest.mark.asyncio
+async def test_synthetic_llm_campaign_routes_all_roles_and_records_traces(sandbox,monkeypatch):
+    roles=('initializer','developer','critic','researcher')
+    settings={'base_url':'https://example.test/v1','api_key':'test','models':[{'id':role} for role in roles]}
+    monkeypatch.setattr(store,'settings',lambda:settings)
+    config=cfg(markets=['BTC'],llm_budget_usd=0,agents={role:{'model':role} for role in roles})
+    c=engine.create(config)
+    await engine.prepare(c)
+    assert engine.datasets(c,calibrate=True)[0]['provenance']['synthetic']
+    assert history.campaign_input(c)['campaign']['agent_mode']=='llm'
+    replies={
+        'initializer':{'hypotheses':[{'category':key,'summary':'Test pipeline stage behavior','hypothesis':'Measure the effect of a stage configuration.'} for key,_,_ in engine.CATEGORIES]},
+        'developer':{'summary':'Use a constant forecast','cells':{'models':'def stage_models(history,state):\n    state["forecast"]=0.01\n    return state\n'}},
+        'critic':{'approved':True},
+        'researcher':{'placement':'none'},
+    }
+    class Response:
+        def __init__(self,role):self.role=role
+        def raise_for_status(self):pass
+        def json(self):
+            return {'choices':[{'message':{'content':json.dumps(replies[self.role])}}],
+                    'usage':{'prompt_tokens':4000,'completion_tokens':500}}
+    class Client:
+        def __init__(self,**kwargs):pass
+        async def __aenter__(self):return self
+        async def __aexit__(self,*args):pass
+        async def post(self,url,**kwargs):
+            assert url=='https://example.test/v1/chat/completions'
+            return Response(kwargs['json']['model'])
+    monkeypatch.setattr(provider.httpx,'AsyncClient',Client)
+    await engine.seed_hypotheses(c)
+    n=engine.getnode(c,'h-models')
+    await engine.develop(c,n)
+    await engine.critic(c,n)
+    assert c['phase']=='evaluate'
+    n.update(metrics={'sharpe':1.},reward=.1)
+    await engine.research(c,n)
+    with store.connect() as db:
+        traces=[json.loads(row['body']) for row in db.execute("SELECT body FROM outbox WHERE json_extract(body,'$.type')='llm' ORDER BY rowid")]
+    assert [item['role'] for item in traces]==list(roles)
+    assert all(item['input'] and json.loads(item['output'])==replies[item['role']] for item in traces)
+
 
 def test_zero_limits_and_annealing(sandbox):
     c=engine.create(cfg(llm_budget_usd=0,llm_token_budget=0,evaluation_budget_seconds=0,evaluation_seconds=0,max_nodes=0,critic_retries=0,markets=['BTC','DOGE','xyz:AAPL']))
@@ -170,3 +237,33 @@ def test_campaign_requires_explicit_markets(sandbox):
     response=sandbox.post('/api/campaigns',json={'prompt':'Investigate market momentum'})
     assert response.status_code==422
     assert 'markets' in response.text
+
+
+@pytest.mark.asyncio
+async def test_weekly_candles_include_latest_close_and_align_funding(sandbox, monkeypatch):
+    week = 604_800_000
+    boundary = (1_800_000_000_000 // week) * week
+    candles = [
+        {'t': opening, 'T': opening + week - 1, 'o': '100', 'h': '101', 'l': '99', 'c': '100', 'v': '1'}
+        for opening in range(boundary - 150 * week, boundary + week, week)
+    ]
+
+    async def info(payload):
+        if payload['type'] == 'candleSnapshot':
+            assert payload['req']['interval'] == '1w'
+            assert payload['req']['endTime'] == boundary
+            return candles
+        assert payload['endTime'] == boundary - 1
+        return [
+            {'time': boundary - week - 1, 'fundingRate': '0.001'},
+            {'time': boundary - week, 'fundingRate': '0.002'},
+            {'time': boundary - 1, 'fundingRate': '0.004'},
+        ]
+
+    monkeypatch.setattr(market, 'info', info)
+    dataset = await market.candles({'id': 'BTC', 'type': 'perp'}, cfg(interval='1w', bars=150), boundary + 1)
+    rows = dataset['records']
+    assert len(rows) == 150
+    assert rows[-1]['available_at'] == boundary
+    assert rows[-2]['funding'] == pytest.approx(.001)
+    assert rows[-1]['funding'] == pytest.approx(.006)

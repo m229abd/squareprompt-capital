@@ -14,7 +14,11 @@ from . import store
 from .notebooks import fingerprint
 
 INFO='https://api.hyperliquid.xyz/info'
-INTERVAL_MS={'15m':900000,'1h':3600000,'4h':14400000,'1d':86400000}
+INTERVAL_MS = {
+    '1m': 60_000, '3m': 180_000, '5m': 300_000, '15m': 900_000, '30m': 1_800_000,
+    '1h': 3_600_000, '2h': 7_200_000, '4h': 14_400_000, '8h': 28_800_000, '12h': 43_200_000,
+    '1d': 86_400_000, '3d': 259_200_000, '1w': 604_800_000,
+}
 
 async def info(payload):
     async with httpx.AsyncClient(timeout=40) as client:
@@ -86,16 +90,17 @@ async def fee_for(market,wallet=''):
 
 async def candles(market,cfg,end_ms):
     interval=INTERVAL_MS[cfg['interval']]
-    end_ms=(end_ms//interval)*interval-1  # only fully closed candles
-    start=end_ms-(cfg['bars']+3)*interval
-    body={'type':'candleSnapshot','req':{'coin':market['id'],'interval':cfg['interval'],'startTime':start,'endTime':end_ms}}
+    closed_before = (end_ms // interval) * interval
+    end_ms = closed_before - 1
+    start = closed_before - (cfg['bars'] + 3) * interval
+    body={'type':'candleSnapshot','req':{'coin':market['id'],'interval':cfg['interval'],'startTime':start,'endTime':closed_before}}
     key='candles-'+fingerprint(body)
     with store.connect() as db:
         row=db.execute('SELECT body FROM cache WHERE id=?',(key,)).fetchone()
     if row:
         return json.loads(row['body'])
     data=await info(body)
-    records=sorted([{'time':int(r['t']),'available_at':int(r['T'])+1,'open':float(r['o']),'close':float(r['c']),'high':float(r['h']),'low':float(r['l']),'volume':float(r['v'])} for r in data if int(r['T'])<end_ms],key=lambda x:x['time'])
+    records=sorted([{'time':int(r['t']),'available_at':int(r['T'])+1,'open':float(r['o']),'close':float(r['c']),'high':float(r['h']),'low':float(r['l']),'volume':float(r['v'])} for r in data if int(r['T']) < closed_before],key=lambda x:x['time'])
     if len(records)<cfg['bars']:
         raise ValueError(f"{market['id']}: only {len(records)} closed bars available, need {cfg['bars']}; choose a shorter history.")
     records=records[-cfg['bars']:]
@@ -118,8 +123,14 @@ async def candles(market,cfg,end_ms):
             await asyncio.sleep(.15)
         if not funding:
             raise ValueError(f"No historical funding for {market['id']}; perpetual scoring requires it.")
-    for r in records:
-        r['funding']=sum(float(f['fundingRate']) for f in funding if r['time']<=int(f['time'])<r['available_at'])
+    for record in records:
+        record['funding'] = 0.0
+    first_open = records[0]['time']
+    for event in funding:
+        timestamp = int(event['time'])
+        index = (timestamp - first_open) // interval
+        if 0 <= index < len(records) and timestamp < records[index]['available_at']:
+            records[index]['funding'] += float(event['fundingRate'])
     saved={'id':key,'market':market,'records':records,'downloaded_at':time.time(),'bytes':len(json.dumps(records)),'start':records[0]['time'],'end':records[-1]['time'],'provenance':{'request':body,'sha256':fingerprint(records),'funding_events':len(funding)}}
     with store.connect() as db:
         db.execute('INSERT OR REPLACE INTO cache VALUES(?,?)',(key,json.dumps(saved)))

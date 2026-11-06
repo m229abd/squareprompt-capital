@@ -2,7 +2,10 @@ import json
 import time
 import httpx
 from . import store
+from .constants import uses_llm
 from .notebooks import fingerprint
+
+LEGACY_CAMPAIGN_MESSAGE='This campaign predates required LLM agents. Start a new campaign with provider models.'
 
 class BudgetExhausted(Exception):
     pass
@@ -75,6 +78,8 @@ def agent_selection(config, role):
             'reasoning':selected.get('reasoning') if selected.get('model') else config.get('reasoning')}
 
 def validate_agents(config, settings):
+    if not uses_llm(config):
+        raise ValueError(LEGACY_CAMPAIGN_MESSAGE)
     if not settings.get('api_key'):
         raise ValueError('Configure your provider API key in Settings, then discover its models.')
     for role in ['developer','researcher','critic','initializer']:
@@ -87,6 +92,8 @@ def validate_agents(config, settings):
 async def call(cid,key,role,payload):
     cfg=store.settings()
     campaign=store.load(cid)
+    if not uses_llm(campaign['config']):
+        raise ValueError(LEGACY_CAMPAIGN_MESSAGE)
     selected=agent_selection(campaign['config'],role)
     model_id=selected['model']
     model=next((m for m in cfg.get('models',[]) if m['id']==model_id),None)

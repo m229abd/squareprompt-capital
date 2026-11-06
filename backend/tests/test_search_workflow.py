@@ -83,28 +83,6 @@ async def test_seed_uses_pool_initializer_and_keeps_legacy_fallback(isolated,bas
     assert provider.agent_selection(c['config'],'initializer')=={'model':'r','reasoning':'low'}
 
 
-def test_sandbox_initial_edits_and_followups_are_finite(baseline):
-    labels=set()
-    for key,_,_ in engine.CATEGORIES:
-        first=engine.demo_hypothesis(key,baseline)
-        n=engine.node('node','category-'+key,key,first['summary'])
-        n['reward']=0.
-        c={'nodes':[n]}
-        patch=engine.demo_patch(c,n,baseline)
-        draft=notebooks.apply_patch(baseline,patch,key)
-        notebooks.validate(draft,baseline,key)
-        child=engine.demo_followup(c,n,draft,baseline)
-        if child['placement']!='none':
-            assert child['summary']!=first['summary']
-            assert 3<=len(child['summary'].split())<=8
-            labels.add(child['summary'])
-        # The finite behavioral options can be exhausted; metadata wrappers never extend them.
-        used={label for nb in (draft,baseline) for label,_ in engine.demo_options(key,nb)}
-        c['nodes'] += [engine.node(str(i),'node',key,label) for i,label in enumerate(used)]
-        assert engine.demo_followup(c,n,draft,baseline)=={'placement':'none'}
-    assert len(labels)>=7
-
-
 @pytest.mark.parametrize('placement',['child','sibling','none',None])
 @pytest.mark.asyncio
 async def test_researcher_placement_pins_notebook_and_reward_parent(isolated,baseline,monkeypatch,placement):

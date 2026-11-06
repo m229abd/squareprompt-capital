@@ -12,3 +12,8 @@ CATEGORIES = [
  ('drift', 'Drift monitoring', 'Changes in inputs or forecast performance and how to respond'),
  ('registry', 'Model registry', 'Model versions, promotion and saved artifacts'),
 ]
+
+
+def uses_llm(config):
+    # Older campaigns opted into provider calls through live-data mode.
+    return (config.get('agent_mode') or ('llm' if config['mode']=='live' else None))=='llm'

@@ -139,8 +139,9 @@ async def test_evaluation_budget_reserves_holdout(isolated,monkeypatch):
         await engine.run_evaluation(c,engine.getnode(c,'baseline'))
 
 @pytest.mark.asyncio
-async def test_resume_does_not_repeat_committed_phase(isolated):
-    c=engine.create(config(bars=200))
+async def test_resume_does_not_repeat_committed_phase(isolated,monkeypatch):
+    monkeypatch.setattr(store,'settings',lambda:{'api_key':'test','models':[{'id':'test-model'}]})
+    c=engine.create(config(bars=200,model='test-model',llm_budget_usd=0))
     await engine.step(c['id'])
     after=store.load(c['id'])
     assert after['phase']=='calibrate'
