@@ -170,3 +170,33 @@ def test_campaign_requires_explicit_markets(sandbox):
     response=sandbox.post('/api/campaigns',json={'prompt':'Investigate market momentum'})
     assert response.status_code==422
     assert 'markets' in response.text
+
+
+@pytest.mark.asyncio
+async def test_weekly_candles_include_latest_close_and_align_funding(sandbox, monkeypatch):
+    week = 604_800_000
+    boundary = (1_800_000_000_000 // week) * week
+    candles = [
+        {'t': opening, 'T': opening + week - 1, 'o': '100', 'h': '101', 'l': '99', 'c': '100', 'v': '1'}
+        for opening in range(boundary - 150 * week, boundary + week, week)
+    ]
+
+    async def info(payload):
+        if payload['type'] == 'candleSnapshot':
+            assert payload['req']['interval'] == '1w'
+            assert payload['req']['endTime'] == boundary
+            return candles
+        assert payload['endTime'] == boundary - 1
+        return [
+            {'time': boundary - week - 1, 'fundingRate': '0.001'},
+            {'time': boundary - week, 'fundingRate': '0.002'},
+            {'time': boundary - 1, 'fundingRate': '0.004'},
+        ]
+
+    monkeypatch.setattr(market, 'info', info)
+    dataset = await market.candles({'id': 'BTC', 'type': 'perp'}, cfg(interval='1w', bars=150), boundary + 1)
+    rows = dataset['records']
+    assert len(rows) == 150
+    assert rows[-1]['available_at'] == boundary
+    assert rows[-2]['funding'] == pytest.approx(.001)
+    assert rows[-1]['funding'] == pytest.approx(.006)
