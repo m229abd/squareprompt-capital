@@ -83,9 +83,12 @@ async def test_holdout_not_exposed_to_development(isolated):
     development=engine.datasets(c)[0]['records']
     final=engine.datasets(c,holdout=True)[0]['records']
     assert len(development)==157
-    # Final evaluation starts after its 64-bar warmup, exactly at the sealed split.
-    assert final[64]['time']>development[-1]['time']
-    assert len(final)==104
+    # Full causal history is available, with fitting fenced before the embargo.
+    held=engine.datasets(c,holdout=True)[0]
+    assert held['evaluation_start']==160
+    assert final[160]['time']>development[-1]['time']
+    assert held['training_cutoff']==development[-1]['available_at']
+    assert len(final)==200
 
 @pytest.mark.asyncio
 async def test_final_selection_frozen_before_holdout(isolated,monkeypatch):

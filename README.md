@@ -2,7 +2,9 @@
 
 A Docker-hosted research lab for discovering cryptocurrency and tokenized-asset trading pipelines on Hyperliquid. It combines an annealed stochastic Monte Carlo tree search, versioned Jupyter notebooks, developer/critic/researcher agents, and durable Temporal workflows with a React + shadcn/ui interface.
 
-This release runs research campaigns and scheduled research refreshes. **It does not submit live orders.** The baseline is a runnable, causal momentum pipeline. Sandbox campaigns use explicitly synthetic data and deterministic agent edits; live-data campaigns use the configured provider and real exchange data. Sandbox results are never represented as investment performance.
+This release runs research campaigns and scheduled research refreshes. **It does not submit live orders.** The baseline is a causal ridge-regression pipeline with ten OHLCV features, cost-aware signals, volatility sizing and retraining every 14 elapsed market days. Sandbox campaigns use explicitly synthetic data and deterministic agent edits; live-data campaigns use the configured provider and real exchange data. Sandbox results are never represented as investment performance.
+
+![Squareprompt Capital research workspace showing the hypothesis search tree and development performance chart](docs/research-workspace-screenshot.png)
 
 ## Start
 
@@ -28,14 +30,14 @@ The local service ports deliberately avoid common existing research installation
 Start the bundled self-hosted Opik stack when you need LLM traces:
 
 ```bash
-docker compose --profile opik up -d
+docker compose --profile opik up -d opik-ui
 ```
 
-Opik uses the official 1.11.14 Compose infrastructure adapted for trace collection, without its privileged Python execution service. Its MySQL, ClickHouse, Redis, ZooKeeper, and MinIO services have their own persistent volumes. Allow several additional GB of RAM. If Opik is offline, every LLM input/output stays in the local call ledger and durable outbox until it can be delivered. The core stack needs approximately 2–4 GB; the complete observability stack needs more. All host ports bind to loopback.
+The isolated Opik profile uses Opik 1.11.14 with persistent MySQL, ClickHouse, Redis, ZooKeeper, and MinIO volumes and Docker memory limits. Its frontend is at [localhost:5174](http://localhost:5174), and the app's Observability page checks it before offering the link. Live agent inputs and outputs appear in the `squareprompt-capital` Opik project. If Opik is offline, the local call ledger and durable outbox retain them for retry. Allow about 2 GiB for the optional services; their host UI port binds to loopback.
 
 ### Interrupted campaigns
 
-Power loss or a worker restart preserves Temporal history, research state, dataset snapshots, and notebooks. Run `docker compose up -d` again. Transient network/provider failures retry with exponential backoff. Permanent configuration errors surface as **Needs attention**; fix the issue and press **Resume**. **Pause** takes effect at a durable step boundary, after in-flight work finishes. **Finish search** freezes the best evaluated notebook and runs the reserved holdout. It does not destroy history.
+Power loss or a worker restart preserves Temporal history, research state, dataset snapshots, and notebooks. New Temporal histories contain the campaign settings, named stage inputs and results, checkpoint progress, notebook commits, and final winner and holdout metrics. Raw agent messages stay in Opik and the local ledger. Run `docker compose up -d` again. Transient network/provider failures retry with exponential backoff. Permanent configuration errors surface as **Needs attention**; fix the issue and press **Resume**. **Pause** takes effect at a durable step boundary, after in-flight work finishes. **Finish search** freezes the best evaluated notebook and runs the reserved holdout. It does not destroy history.
 
 To stop containers while retaining research, use `docker compose stop` or `docker compose down`. Removing Docker volumes deletes research state. Back up the named research and Temporal volumes together with `notebook-history/` for consistent recovery.
 
@@ -44,25 +46,25 @@ To stop containers while retaining research, use `docker compose stop` or `docke
 The interface uses a blue spruce palette. The wizard is ordered **Research brief → Markets & agents → Compute & data → Review & launch**.
 
 - Select listed Hyperliquid markets by search or exact ID, including HIP-3 and spot IDs. Both sandbox and live modes fetch the exchange catalog when the wizard opens; no market options or initial selections are hardcoded.
-- Select Developer, Researcher and Critic models and reasoning efforts separately. Configure the provider in Settings, then fetch its model catalog in the wizard. Role choices can be remembered as defaults.
+- Select Pool initialization, Developer, Researcher and Critic models and reasoning efforts separately. The initializer falls back to the Researcher when left unset. Every reasoning input has a visible Suggestions menu and accepts typed values. Configure the provider in Settings, then fetch its model catalog in the wizard. Role choices can be remembered as defaults.
 - **0 means unlimited** for USD, tokens, total evaluation seconds, experiment count, critic retries and refresh-run count. A zero target duration uses all available development data. Docker CPU/RAM containment and trading risk constraints remain in force. With every search ceiling disabled, finish or pause manually; annealing uses only enabled ceilings.
-- Set target evaluation time before evaluation data. Untouched history defaults adapt using the latest measured pilot when available; manual data choices remain intact. Each new campaign still measures its own baseline.
+- Set target evaluation time before evaluation data. History (bars) is a requested candle count per market. The time-based suggestion uses a prior baseline pilot when available and adjusts for the chosen holdout and embargo. Use 4,900 bars to request the app maximum while keeping the time target; set target time to zero to score all selected development history. The wizard shows how the requested bars are split. Each new campaign still measures its own baseline, and manual history stays as set.
 - Review latest fetched taker fees, hourly funding, bid/ask and full spread. Launch pins that exact snapshot across all nodes and the final holdout. Refresh schedules fetch new snapshots per campaign.
 - A finite USD budget requires verified pricing for each chosen role model. With USD set to 0, models without pricing can run; unknown dollar costs are displayed as unknown while tokens are still tracked.
 
 ## What is implemented
 
 - Twelve exact category branches immediately below the baseline, with per-category notebook edit scopes.
-- Tree descent using epsilon-greedy UCT. Exploration is `max(0, 1 − max(USD fraction, token fraction, evaluation-time fraction, experiment fraction))`: 1 is uniform exploration; 0 is greedy UCT selection. Unvisited branches are selected uniformly.
+- Annealed search mixes uniform frontier sampling with reward-guided tree descent. Exploration is `max(0, 1 − max(USD fraction, token fraction, evaluation-time fraction, experiment fraction))`: 1 is uniform across queued hypotheses; 0 is greedy by mean reward. In-flight compute reservations do not count as elapsed evaluation time. The workspace displays the value recorded for the active decision.
 - Each reward is **child objective − its evaluated hypothesis parent's objective**; reward and visits backpropagate along hypothesis ancestry. Gains remain signed.
 - Objectives: annualized Sharpe, net income after fees/funding/slippage, or return minus twice maximum drawdown. The Pareto set maximizes return and Sharpe while minimizing drawdown.
 - A developer → deterministic checks → critic → evaluation → researcher loop. Critic feedback drives configurable repair attempts. Developer and researcher have bounded public internet search/reference tools; source downloads use a managed point-in-time JSON gateway.
-- On a new best score, evaluated semantic-merge nodes are queued for the other current Pareto members. Live mode uses the same LLM/critic/evaluation loop. Unexplored hypotheses inherit the latest evaluated champion's notebook at selection, with that inheritance recorded separately from hypothesis ancestry.
+- On a new best score, evaluated semantic-merge nodes are queued for the other current Pareto members. Live mode uses the same LLM/critic/evaluation loop. Initial live hypotheses can inherit the latest champion. Researcher follow-ups choose a child, a sibling, or no proposal. A child starts from the evaluated node; a sibling starts from its comparison parent. Those inputs stay pinned, and additional improvements enter through explicit merge experiments.
 - A real Jupyter kernel executes every candidate before chronological replay. Each function receives completed historical prefixes only. All external observations are filtered by `available_at`. The runner has no dataset volume, provider credentials, Docker socket, or external network route.
 - Immutable chronological final holdout, an embargo, winner selection persisted before holdout access, and idempotent holdout results. Holdout metrics never enter selection, reward, hypothesis generation, or the Pareto set.
 - A short baseline replay measures fixed startup overhead and per-bar compute cost. The application sizes a shared scoring window to the requested target duration. That target is not a cutoff: slower models can finish, and their runtime updates scheduling estimates. Only the remaining total campaign compute allocation imposes a hard deadline.
 - Hard admission limits for LLM USD, tokens, evaluation wall time, experiments, critic retries, and final-holdout reservation. Ambiguous provider failures retain their maximum reservation; retries reserve again because a provider may have billed an unacknowledged call. Known usage settles a reservation down to actual cost.
-- An outer Git repository for the application and a separate ignored inner Git repository at `notebook-history/.git`. Every draft, rejection, execution failure, and evaluated notebook is retained. Per-campaign/node refs and real two-parent Git merge commits preserve provenance. Git is written with Dulwich; host Git is not needed at runtime.
+- An outer Git repository for the application and a separate ignored inner Git repository at `notebook-history/.git`. Every draft, rejection, execution failure, and evaluated notebook is retained. Each evaluated experiment has a `campaigns/<campaign>/<node>` branch that forks at its input notebook commit. Attempts stay on the same branch; semantic merges link two actual parents. Each new commit contains the stable `notebook.ipynb` path for ordinary Git diffs. Git is written with Dulwich; host Git is not needed at runtime.
 - TensorBoard metrics and state transitions per node; MLflow runs, artifacts, model versions, and a `research-winner` alias; Opik traces plus a local searchable call ledger and durable telemetry delivery.
 - Finite Temporal-based interval refresh schedules with explicit total cost envelopes, pause/resume/stop, new datasets per interval, and new versions in the same research registry. No automatically enabled spending schedule.
 - Interactive tree pan/zoom, fit, minimap, collapse/expand, status/reward labels, node inspection and notebook download; campaign history; data cache; artifact registry; provider discovery and budgets.
@@ -105,3 +107,19 @@ docker compose up -d --no-build
 ```
 
 `PIP_INDEX_URL` is an optional backend build argument for an approved package mirror. All application processes, builds, notebook kernels, tests, and observability services run in Docker.
+
+
+### Bundled ML baseline
+
+`baseline.ipynb` fits a separate regularized return model for each market, using only completed candles and fully observed four-bar targets. It starts after 32 matured examples, then refits every 14 elapsed days on a trailing 90-day window capped at 2,048 examples. Scaling is fitted on training data; once 80 examples are available, a purged chronological training split selects ridge regularization. Coefficients remain fixed between updates.
+
+The model predicts next-open to fourth-following-close returns. Entry bands include pinned round-trip fees/spread, adverse funding and forecast uncertainty. Annualized volatility sizing targets 15%, subject to an 0.8× sleeve cap and the campaign exposure cap. Small same-direction sizing changes are suppressed; a 15% sleeve drawdown latches its kill switch for the rest of that replay. Causal feature outliers or a volatility spike reduce exposure.
+
+Final holdout predictions may use completed observations for indicators, but **fitting, scaling and parameter selection use only pre-embargo history**. The final model is initialized from this longer training prefix rather than a 64-bar warmup. Full holdout length and prior winner selection remain unchanged. Short calibration/search windows may contain no scheduled refit; they still run the initial fit, and longer windows exercise the same two-week update rule.
+
+Each fit's coefficients, scaler, chosen regularization, sample count, timestamps and uncertainty are retained in the evaluated notebook and MLflow `models.json`; TensorBoard records fit events. These artifacts are research models, and sandbox results do not measure live trading performance. The retraining cell is the single source of the model cadence. A research refresh starts a separate campaign only when you explicitly create a schedule and enter its interval.
+
+
+### Development benchmarks
+
+The Development performance chart compares the best pipeline and baseline with Buy & hold. The benchmark appears when calibration fixes the scored development window, and uses equal capital per market and the campaign's exposure cap at entry. It holds fixed quantities from the first scored open through the last scored close and includes entry/exit taker fees, half-spread and funding. The benchmark reads the frozen development snapshot, is cached per campaign, and never affects model selection.

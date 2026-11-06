@@ -4,16 +4,18 @@ import os
 import time
 import uuid
 from contextlib import asynccontextmanager
+from functools import lru_cache
+from threading import Lock
 from pathlib import Path
 import httpx
-from fastapi import FastAPI, HTTPException
-from fastapi.responses import FileResponse
+from fastapi import FastAPI, HTTPException, Query
+from fastapi.responses import JSONResponse, Response
 from temporalio.client import Client
 from temporalio.exceptions import WorkflowAlreadyStartedError
-from . import engine, notebooks, provider, search, store
+from . import engine, history, notebooks, provider, search, store
 from .constants import CATEGORIES
 from .market import discover
-from .schemas import CampaignConfig, ProviderConfig
+from .schemas import CampaignConfig, ProviderConfig, RefreshScheduleRequest
 from .workflows import CampaignWorkflow, RefreshWorkflow
 
 async def temporal():
@@ -22,7 +24,7 @@ async def temporal():
 async def dispatch(cid):
     client=await temporal()
     try:
-        await client.start_workflow(CampaignWorkflow.run,cid,id='campaign-'+cid,task_queue='capital-research')
+        await client.start_workflow(CampaignWorkflow.run,history.campaign_input(store.load(cid)),id='campaign-'+cid,task_queue='capital-research')
     except WorkflowAlreadyStartedError:
         pass
 
@@ -32,13 +34,12 @@ async def lifespan(app):
     async def reconcile():
         while True:
             with store.connect() as db:
-                campaigns=[json.loads(r['body']) for r in db.execute('SELECT body FROM campaigns')]
-            for c in campaigns:
-                if c['status']=='starting':
-                    try:
-                        await dispatch(c['id'])
-                    except Exception:
-                        pass
+                starting=[r['id'] for r in db.execute("SELECT id FROM campaigns WHERE json_extract(body,'$.status')='starting'")]
+            for cid in starting:
+                try:
+                    await dispatch(cid)
+                except Exception:
+                    pass
             with store.connect() as db:
                 schedules=[json.loads(r['body']) for r in db.execute('SELECT body FROM schedules')]
             for s in schedules:
@@ -63,6 +64,7 @@ def require(cid):
 
 def public(c):
     c['temperature']=search.temperature(c)
+    c['evaluation_spent']=max(0,c['evaluation_spent']-c.get('evaluation_reserved',0))
     for n in c['nodes']:
         if 'sources' in n:
             n['sources']=[{k:v for k,v in s.items() if k!='records'} for s in n['sources']]
@@ -76,18 +78,85 @@ async def health():
         pending=db.execute('SELECT count(*) FROM outbox WHERE sent=0').fetchone()[0]
     return {'status':'ok','pending_telemetry':pending,'version':'0.1.0'}
 
-@app.get('/api/overview')
-def overview():
+@app.get('/api/observability/opik')
+async def opik_status():
+    try:
+        async with httpx.AsyncClient(timeout=2,trust_env=False) as client:
+            response=await client.get('http://opik-ui:5174/api/health-check')
+            online=response.status_code==200
+    except httpx.RequestError:
+        online=False
+    return {'online':online,'url':'http://localhost:5174'}
+
+
+_projection_lock=Lock()
+
+@lru_cache(maxsize=128)
+def campaign_card(root,cid,updated):
     with store.connect() as db:
-        campaigns=[public(json.loads(r['body'])) for r in db.execute('SELECT body FROM campaigns ORDER BY updated DESC')]
+        row=db.execute("""
+            SELECT json_remove(c.body,'$.nodes','$.holdout.curve','$.execution_costs') AS body,
+                (SELECT json_remove(n.value,'$.curve','$.sources','$.source_requests')
+                 FROM json_each(c.body,'$.nodes') AS n
+                 WHERE json_extract(n.value,'$.id')=json_extract(c.body,'$.best') LIMIT 1) AS best_node
+            FROM campaigns AS c WHERE c.id=?
+        """,(cid,)).fetchone()
+    card=json.loads(row['body'])
+    card['nodes']=[json.loads(row['best_node'])] if row['best_node'] else []
+    return public(card)
+
+
+@lru_cache(maxsize=3)
+def campaign_detail(root,cid,updated):
+    with store.connect() as db:
+        row=db.execute("""
+            SELECT json_set(c.body,'$.nodes',json((
+                SELECT json_group_array(json_set(
+                    CASE WHEN json_extract(n.value,'$.id') IN ('baseline',json_extract(c.body,'$.best'))
+                         THEN n.value ELSE json_remove(n.value,'$.curve') END,
+                    '$.sources',json((SELECT json_group_array(json_remove(s.value,'$.records'))
+                                      FROM json_each(n.value,'$.sources') AS s))
+                ))
+                FROM json_each(c.body,'$.nodes') AS n
+            ))) AS body FROM campaigns AS c WHERE c.id=?
+        """,(cid,)).fetchone()
+    return public(json.loads(row['body']))
+
+
+def campaign_index(db,selected=None,*,include_detail=True):
+    entries=db.execute('SELECT id,updated FROM campaigns ORDER BY updated DESC').fetchall()
+    ids={r['id'] for r in entries}
+    selected=(selected if selected in ids else entries[0]['id']) if include_detail and entries else None
+    # Serialize cold projection reads across tabs; reuse the projection until the row changes.
+    with _projection_lock:
+        root=str(store.ROOT)
+        return [(campaign_detail if row['id']==selected else campaign_card)(root,row['id'],row['updated']) for row in entries]
+
+
+@lru_cache(maxsize=1)
+def dataset_catalog(root,revision):
+    with store.connect() as db:
+        return [json.loads(row['body']) for row in db.execute(
+            "SELECT json_remove(body,'$.records') AS body FROM cache WHERE id LIKE 'candles-%' OR id LIKE 'demo-%'")]
+
+
+@app.get('/api/overview')
+def overview(campaign_id:str|None=None):
+    with store.connect() as db:
+        campaigns=campaign_index(db,campaign_id)
         events=[dict(r) for r in db.execute('SELECT * FROM events ORDER BY id DESC LIMIT 16')]
-        cache=[json.loads(r['body']) for r in db.execute("SELECT body FROM cache WHERE id LIKE 'candles-%' OR id LIKE 'demo-%'")]
+        revision=tuple(tuple(row) for row in db.execute(
+            "SELECT id,rowid FROM cache WHERE id LIKE 'candles-%' OR id LIKE 'demo-%' ORDER BY id"))
+        with _projection_lock:
+            cache=dataset_catalog(str(store.ROOT),revision)
         outbox=[dict(r) for r in db.execute('SELECT id,sent,error FROM outbox WHERE sent=0 LIMIT 10')]
-    return {'campaigns':campaigns,'events':events,'datasets':[{k:v for k,v in d.items() if k!='records'} for d in cache],'telemetry':outbox,'categories':[{'id':k,'name':n,'description':d} for k,n,d in CATEGORIES]}
+    return JSONResponse({'campaigns':campaigns,'events':events,'datasets':cache,'telemetry':outbox,'categories':[{'id':k,'name':n,'description':d} for k,n,d in CATEGORIES]})
+
 
 @app.get('/api/campaigns')
 def campaigns():
-    return overview()['campaigns']
+    with store.connect() as db:
+        return JSONResponse(campaign_index(db,include_detail=False))
 
 @app.post('/api/campaigns',status_code=201)
 async def create_campaign(config:CampaignConfig):
@@ -111,7 +180,46 @@ async def create_campaign(config:CampaignConfig):
 
 @app.get('/api/campaigns/{cid}')
 def campaign(cid:str):
-    return public(require(cid))
+    with store.connect() as db:
+        row=db.execute('SELECT updated FROM campaigns WHERE id=?',(cid,)).fetchone()
+    if row is None:
+        raise HTTPException(404,'Campaign not found')
+    with _projection_lock:
+        detail=campaign_detail(str(store.ROOT),cid,row['updated'])
+    return JSONResponse(detail)
+
+@app.get('/api/campaigns/{cid}/benchmarks')
+def campaign_benchmarks(cid:str):
+    from .benchmarks import development_benchmarks
+    from .market import INTERVAL_MS
+    from .compute import WARMUP
+    key=f'benchmarks-v2:{cid}'
+    with store.connect() as db:
+        cached=db.execute('SELECT body FROM cache WHERE id=?',(key,)).fetchone()
+        if cached:
+            return json.loads(cached['body'])
+        row=db.execute("""SELECT json_extract(body,'$.config') AS config,
+                               json_extract(body,'$.dataset_ids') AS datasets,
+                               json_extract(body,'$.calibration') AS calibration,
+                               json_extract(body,'$.nodes[0].curve') AS curve
+                        FROM campaigns WHERE id=?""",(cid,)).fetchone()
+    if row is None:
+        raise HTTPException(404,'Campaign not found')
+    c={'id':cid,'config':json.loads(row['config']),'dataset_ids':json.loads(row['datasets']),
+       'calibration':json.loads(row['calibration']) if row['calibration'] else None}
+    times=[point['time'] for point in json.loads(row['curve'] or '[]')]
+    if not times and not c['calibration']:
+        raise HTTPException(409,'Buy & hold is available after the development window is calibrated.')
+    try:
+        datasets=engine.datasets(c)
+        if not times and datasets:
+            times=[point['time'] for point in datasets[0]['records'][WARMUP:]]
+        result=development_benchmarks(c['config'],datasets,INTERVAL_MS[c['config']['interval']],times)
+    except (KeyError,TypeError,ValueError) as exc:
+        raise HTTPException(409,f'Development benchmarks unavailable: {exc}') from exc
+    with store.connect() as db:
+        db.execute('INSERT OR IGNORE INTO cache VALUES(?,?)',(key,json.dumps(result,allow_nan=False)))
+    return result
 
 @app.post('/api/campaigns/{cid}/{action}')
 async def control(cid:str,action:str):
@@ -165,7 +273,7 @@ def download_notebook(cid:str,nid:str):
         raise HTTPException(404,'Node not found')
     if not n.get('notebook'):
         raise HTTPException(404,'Notebook not created yet')
-    return FileResponse(notebooks.repo(cid)/n['notebook']['path'],filename=f'{cid}-{nid}.ipynb',media_type='application/x-ipynb+json')
+    return Response(json.dumps(notebooks.read(cid,n['notebook']),indent=1,ensure_ascii=False),media_type='application/x-ipynb+json',headers={'Content-Disposition':f'attachment; filename="{cid}-{nid}.ipynb"'})
 
 @app.get('/api/campaigns/{cid}/events')
 def events(cid:str):
@@ -257,15 +365,13 @@ def schedules():
         return [json.loads(r['body']) for r in db.execute('SELECT body FROM schedules ORDER BY rowid DESC')]
 
 @app.post('/api/schedules',status_code=201)
-async def schedule_refresh(body:dict):
-    parent=require(body['campaign'])
+async def schedule_refresh(body:RefreshScheduleRequest):
+    parent=require(body.campaign)
     if parent['status']!='completed' or not parent['selected']:
         raise HTTPException(422,'Complete the initial campaign before scheduling interval research refreshes.')
-    interval=int(body.get('interval_hours',24));runs=int(body.get('max_runs',3))
-    if not 1<=interval<=720 or not 0<=runs<=100:
-        raise HTTPException(422,'Interval must be 1–720 hours and runs must be 0–100 (0 means unlimited).')
+    interval=body.interval_hours;runs=body.max_runs
     sid=uuid.uuid4().hex[:12]
-    schedule={'id':sid,'campaign':parent['id'],'interval_hours':interval,'max_runs':runs,'completed_runs':0,'campaigns':[],'status':'active','next_at':time.time()+interval*3600,'reserved_llm_ceiling':parent['config']['llm_budget_usd']*runs or None,'reserved_eval_ceiling':parent['config']['evaluation_budget_seconds']*runs or None}
+    schedule={'history_version':2,'id':sid,'campaign':parent['id'],'interval_hours':interval,'max_runs':runs,'completed_runs':0,'campaigns':[],'status':'active','next_at':time.time()+interval*3600,'reserved_llm_ceiling':parent['config']['llm_budget_usd']*runs or None,'reserved_eval_ceiling':parent['config']['evaluation_budget_seconds']*runs or None}
     with store.transaction() as db:
         db.execute('INSERT INTO schedules VALUES(?,?)',(sid,json.dumps(schedule)))
     try:
@@ -297,28 +403,41 @@ async def execution_quotes(config:CampaignConfig):
     except (ValueError,httpx.HTTPError) as exc: raise HTTPException(422,str(exc))
 
 @app.get('/api/evaluation-defaults')
-def evaluation_defaults(target_seconds:int=15,market_count:int=1,mode:str='demo'):
-    import math
-    if target_seconds<0 or not 1<=market_count<=200:raise HTTPException(422,'Invalid target or market count')
-    with store.connect() as db: campaigns=[json.loads(r['body']) for r in db.execute('SELECT body FROM campaigns ORDER BY updated DESC')]
-    reference=next((c for c in campaigns if c.get('calibration',{} ) and c['calibration'].get('seconds_per_portfolio_bar') and c['config']['mode']==mode),None)
-    if target_seconds==0:bars=4900
-    elif reference:
-        p=reference['calibration'];cost=p['seconds_per_portfolio_bar']*(market_count/max(1,len(reference['config']['markets'])))**2
-        steps=max(20,int(max(0,target_seconds-p.get('startup_seconds',0))/cost))
-        bars=math.ceil((64+steps+3)/.8)
-    else:bars=round(720*target_seconds/15/max(1,market_count/3))
-    return {'bars':min(4900,max(150,int(bars))),'interval':'1h','holdout_fraction':.2,'embargo_bars':3,'measured':bool(reference),'reference_campaign':reference['id'] if reference else None,'note':'Suggested from a previous pilot; this campaign remeasures inside Docker.' if reference else 'Initial estimate; this campaign measures actual compute before selecting its scoring window.'}
+def evaluation_defaults(target_seconds:int=Query(15,ge=0,le=3600),market_count:int=Query(1,ge=1,le=200),
+                        mode:str='demo',holdout_fraction:float=Query(.2,ge=.1,le=.4),
+                        embargo_bars:int=Query(3,ge=1,le=50)):
+    from .compute import suggested_history
+    if mode not in {'demo','live'}:
+        raise HTTPException(422,'Unknown campaign mode')
+    reference=None
+    if target_seconds:
+        with store.connect() as db:
+            reference=db.execute("""
+                SELECT id,json_extract(body,'$.calibration.seconds_per_portfolio_bar') AS bar_seconds,
+                          COALESCE(json_extract(body,'$.calibration.startup_seconds'),0) AS startup_seconds,
+                          json_array_length(body,'$.config.markets') AS market_count
+                FROM campaigns
+                WHERE json_extract(body,'$.config.mode')=? AND bar_seconds>0
+                ORDER BY updated DESC LIMIT 1
+            """,(mode,)).fetchone()
+    bars=suggested_history(target_seconds,market_count,holdout_fraction,embargo_bars,reference)
+    note=('Maximum requested history; all selected development bars are used.' if not target_seconds else
+          'Time-based suggestion from a previous pilot. This campaign measures its own speed.' if reference else
+          'Time-based estimate. The baseline pilot measures this campaign’s speed.')
+    return {'bars':bars,'interval':'1h','holdout_fraction':.2,'embargo_bars':3,'measured':reference is not None,
+            'reference_campaign':reference['id'] if reference else None,'note':note}
 
 @app.put('/api/provider/agents')
 def remember_agents(body:dict):
     from .schemas import AgentConfig
-    if set(body)!={'developer','researcher','critic'}:raise HTTPException(422,'Set all three agent roles.')
+    required={'developer','researcher','critic'}
+    if not required<=set(body)<=required|{'initializer'}:raise HTTPException(422,'Set Developer, Researcher and Critic; Pool initialization is optional.')
     cfg=store.settings()
     selected={r:AgentConfig.model_validate(v).model_dump() for r,v in body.items()}
     for role,choice in selected.items():
+        if role=='initializer' and not choice['model']:continue
         model=next((m for m in cfg.get('models',[]) if m['id']==choice['model']),None)
         if not model:raise HTTPException(422,f'{role}: choose a discovered model.')
-    cfg['default_agents']=selected
+    cfg['default_agents']={**cfg.get('default_agents',{}),**selected}
     with store.connect() as db:db.execute('INSERT OR REPLACE INTO settings VALUES(1,?)',(json.dumps(cfg),))
     return {'saved':True}

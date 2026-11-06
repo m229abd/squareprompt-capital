@@ -15,6 +15,11 @@ def source(cell):
     s=cell.get('source','')
     return ''.join(s) if isinstance(s,list) else s
 
+def code_changed(parent,candidate):
+    def executable(nb):
+        return {cell['id']:ast.dump(ast.parse(source(cell))) for cell in nb['cells'] if cell['cell_type']=='code'}
+    return executable(parent)!=executable(candidate)
+
 def validate(nb, parent=None, category=None, merge=False):
     nbformat.validate(nbformat.from_dict(nb))
     cells={c.get('id'):c for c in nb['cells']}
@@ -56,44 +61,68 @@ def repo(cid):
         Repo.init(str(path))
     return path
 
-def commit(cid,nid,attempt,nb,status,parents=None):
+NOTEBOOK_PATH=b'notebook.ipynb'
+
+def commit(cid,nid,attempt,nb,status,parents=None,base=None):
     import time
     import fcntl
     from dulwich.repo import Repo
     from dulwich import porcelain
-    from dulwich.objects import Commit
+    from dulwich.objects import Blob, Commit
+    from dulwich.index import commit_tree
     path=repo(cid)
-    name=f'{cid}/{nid}-attempt-{attempt}-{status}.ipynb'
-    (path/cid).mkdir(exist_ok=True)
-    target=path/name
-    encoded=json.dumps(nb,indent=1,ensure_ascii=False)
-    # One lock covers the index and refs for all campaigns in the shared inner Git.
-    with (path/'.git'/'capital.lock').open('a') as lock:
+    branch=f'campaigns/{cid}/{nid}'
+    ref=f'refs/heads/{branch}'.encode()
+    encoded=json.dumps(nb,indent=1,ensure_ascii=False).encode()
+    message=f'{nid}: {status} (attempt {attempt})'.encode()
+    # Update only this branch. The checkout and other experiment refs are untouched.
+    with (path/'.git'/'capital.lock').open('a') as lock, Repo(str(path)) as repository:
         fcntl.flock(lock,fcntl.LOCK_EX)
-        repository=Repo(str(path))
-        if target.exists() and target.read_text()==encoded:
+        tip=repository.refs.read_ref(ref)
+        blob=Blob.from_string(encoded)
+        repository.object_store.add_object(blob)
+        tree=commit_tree(repository.object_store,[(NOTEBOOK_PATH,blob.id,0o100644)])
+        ancestry=list(dict.fromkeys(p.encode() for p in parents)) if parents else ([tip] if tip else [base['sha'].encode()] if base else [])
+        if tip and repository[tip].tree==tree and repository[tip].message==message and (not parents or repository[tip].parents==ancestry):
+            sha=tip
+        else:
+            revision=Commit()
+            revision.tree=tree
+            revision.parents=ancestry
+            revision.author=revision.committer=b'Squareprompt Research <research@squareprompt.local>'
+            revision.author_time=revision.commit_time=int(time.time())
+            revision.author_timezone=revision.commit_timezone=0
+            revision.message=message
+            repository.object_store.add_object(revision)
+            sha=revision.id
+            repository.refs[ref]=sha
             try:
-                return {'path':name,'sha':repository.head().decode()}
+                repository.head()
             except KeyError:
-                pass
-        target.write_text(encoded)
-        porcelain.add(repository,paths=[str(target)])
-        sha=porcelain.commit(repository,message=f'{nid}: {status} (attempt {attempt})'.encode(),author=b'Squareprompt Research <research@squareprompt.local>')
-        if parents and len(set(parents))>1:
-            merge=Commit()
-            merge.tree=repository[sha].tree
-            merge.parents=[p.encode() for p in dict.fromkeys(parents)]
-            merge.author=merge.committer=b'Squareprompt Research <research@squareprompt.local>'
-            merge.author_time=merge.commit_time=int(time.time())
-            merge.author_timezone=merge.commit_timezone=0
-            merge.message=f'{nid}: semantic merge'.encode()
-            repository.object_store.add_object(merge)
-            sha=merge.id
-        repository.refs[f'refs/heads/campaigns/{cid}/{nid}'.encode()]=sha
-        return {'path':name,'sha':sha.decode()}
+                # Initialize a browseable checkout once; later commits use plumbing only.
+                repository.refs[b'HEAD']=sha
+                porcelain.reset(repository,'hard',sha)
+        name=f'.git/capital-artifacts/{cid}/{nid}-attempt-{attempt}-{status}-{sha.decode()}.ipynb'
+        target=path/name
+        target.parent.mkdir(parents=True,exist_ok=True)
+        if not target.exists():
+            temporary=target.with_suffix('.tmp')
+            temporary.write_bytes(encoded)
+            temporary.replace(target)
+    return {'path':name,'sha':sha.decode(),'branch':branch}
 
 def read(cid,ref):
-    return json.loads((repo(cid)/ref['path']).read_text())
+    from dulwich.repo import Repo
+    from dulwich.object_store import tree_lookup_path
+    path=repo(cid)
+    with Repo(str(path)) as repository:
+        revision=repository[ref['sha'].encode()]
+        try:
+            _,blob=tree_lookup_path(repository.__getitem__,revision.tree,NOTEBOOK_PATH if ref.get('branch') else ref['path'].encode())
+        except KeyError:
+            # Some legacy records predate per-node commits and point to a shared checkout.
+            return json.loads((path/ref['path']).read_text())
+        return json.loads(repository[blob].data)
 
 def fingerprint(value):
     return hashlib.sha256(json.dumps(value,sort_keys=True).encode()).hexdigest()

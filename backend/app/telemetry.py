@@ -1,7 +1,17 @@
+import hashlib
 import json
 import os
 import time
+from uuid import UUID
 from . import store, notebooks
+
+
+def opik_trace_id(ledger_id,start):
+    """A stable UUIDv7 keyed by the original event time and outbox ID."""
+    millis=int(start*1000)
+    entropy=int.from_bytes(hashlib.sha256(ledger_id.encode()).digest()[:10],'big')
+    value=(millis<<80) | (7<<76) | (((entropy>>62)&0xfff)<<64) | (2<<62) | (entropy&((1<<62)-1))
+    return str(UUID(int=value))
 
 
 def flush(limit=20):
@@ -20,10 +30,9 @@ def flush(limit=20):
                         writer.add_scalar('reward/parent_gain',item['reward'],item['step'])
             elif item['type']=='llm':
                 import httpx
-                import uuid
                 from datetime import datetime, timezone
                 start=item['time']
-                body={'id':str(uuid.uuid5(uuid.NAMESPACE_URL,row['id'])),'project_name':'squareprompt-capital','name':item['role'],'start_time':datetime.fromtimestamp(start,timezone.utc).isoformat(),'end_time':datetime.fromtimestamp(start+item.get('elapsed',0),timezone.utc).isoformat(),'input':{'messages':item['input']},'output':{'response':item.get('output'),'error':item.get('error')},'metadata':{'campaign':item['campaign'],'model':item['model'],'ledger_id':row['id'],'cost_usd':item.get('cost_usd'),'usage':item.get('usage')},'tags':[item['campaign'],item['role']],'source':'sdk'}
+                body={'id':opik_trace_id(row['id'],start),'project_name':os.getenv('OPIK_PROJECT_NAME','squareprompt-capital'),'name':item['role'],'start_time':datetime.fromtimestamp(start,timezone.utc).isoformat(),'end_time':datetime.fromtimestamp(start+item.get('elapsed',0),timezone.utc).isoformat(),'input':{'messages':item['input']},'output':{'response':item.get('output'),'error':item.get('error')},'metadata':{'campaign':item['campaign'],'model':item['model'],'ledger_id':row['id'],'cost_usd':item.get('cost_usd'),'usage':item.get('usage')},'tags':[item['campaign'],item['role']],'source':'sdk'}
                 response=httpx.post(os.getenv('OPIK_URL_OVERRIDE','http://opik-backend:8080').rstrip('/')+'/v1/private/traces',json=body,headers={'workspaceName':os.getenv('OPIK_WORKSPACE','default')},timeout=5)
                 if response.status_code!=409:
                     response.raise_for_status()
@@ -36,6 +45,11 @@ def flush(limit=20):
                 with SummaryWriter(str(store.ROOT/'tensorboard'/cid/nid/stage)) as writer:
                     for key,value in result['metrics'].items():
                         writer.add_scalar(key,value,0)
+                    for model in result.get('models',[]):
+                        for index,event in enumerate(model.get('fit_events',[])):
+                            writer.add_scalar(f"models/{model['market']}/training_rows",event['rows'],index)
+                            writer.add_scalar(f"models/{model['market']}/alpha",event['alpha'],index)
+                            writer.add_text(f"models/{model['market']}/fit",json.dumps(event),index)
                     writer.add_text('notebook_commit',result['notebook']['sha'],0)
                 mlflow.set_tracking_uri(os.getenv('MLFLOW_TRACKING_URI','http://mlflow:5000'))
                 mlflow.set_experiment('squareprompt-'+cid)
@@ -48,6 +62,7 @@ def flush(limit=20):
                     mlflow.set_tags({'node':nid,'campaign':cid,'stage':stage,'git_commit':result['notebook']['sha'],'ledger_id':row['id']})
                     mlflow.log_metrics(result['metrics'])
                     mlflow.log_artifact(str(notebooks.repo(cid)/result['notebook']['path']),'notebooks')
+                    if result.get('models'):mlflow.log_dict({'models':result['models']},'models.json')
                     mlflow.log_dict({'curve':result['curve'],'assumptions':result['assumptions']},'evaluation.json')
                     if item['holdout']:
                         name=store.load(cid)['config'].get('registry_name') or 'squareprompt-'+cid

@@ -1,4 +1,7 @@
 <clickhouse>
+    <max_server_memory_usage>603979776</max_server_memory_usage>
+    <mark_cache_size>33554432</mark_cache_size>
+    <uncompressed_cache_size>16777216</uncompressed_cache_size>
     <macros>
         <shard>1</shard>
         <replica>clickhouse</replica>

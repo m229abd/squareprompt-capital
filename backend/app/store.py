@@ -20,6 +20,7 @@ def init():
         db.executescript('''
         CREATE TABLE IF NOT EXISTS schedules(id TEXT PRIMARY KEY, body TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS campaigns(id TEXT PRIMARY KEY, body TEXT NOT NULL, updated REAL);
+        CREATE INDEX IF NOT EXISTS campaigns_updated ON campaigns(updated DESC);
         CREATE TABLE IF NOT EXISTS calls(id TEXT PRIMARY KEY, campaign TEXT, role TEXT, status TEXT, body TEXT);
         CREATE TABLE IF NOT EXISTS cache(id TEXT PRIMARY KEY, body TEXT);
         CREATE TABLE IF NOT EXISTS settings(id INTEGER PRIMARY KEY CHECK(id=1), body TEXT);

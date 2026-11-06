@@ -21,6 +21,7 @@ def evaluate(payload):
     replay_started=time.monotonic()
     cfg=payload['config']
     results=[]
+    model_artifacts=[]
     curves=[]
     all_returns=[]
     bars_per_year=365*24*3600000/payload['interval_ms']
@@ -43,7 +44,8 @@ def evaluate(payload):
         fees_total=0.
         funding_total=0.
         curve=[]
-        start_index=payload.get('warmup',64)
+        start_index=int(dataset.get('evaluation_start',payload.get('warmup',64)))
+        training_cutoff=dataset.get('training_cutoff')
         if len(frame)<start_index+20:
             raise ValueError('Insufficient replay bars after warmup')
         for i in range(start_index-1,len(frame)-1):
@@ -52,6 +54,11 @@ def evaluate(payload):
             # Only observations published by the decision time are passed to the notebook.
             sources={s['name']:[copy.deepcopy(r) for r in s['records'] if r['available_at']<=decision_time] for s in payload.get('sources',[])}
             context={'target':0.,'capital':equity,'peak':peak,'drawdown':1-equity/peak,'previous_position':previous,'market':dataset['market']['id'],'sources':sources,'max_exposure':cfg['max_gross_exposure'],'cross_asset':{symbol:df[df['available_at']<=decision_time].copy(deep=True) for symbol,df in frames.items()}}
+            context['bar_interval_ms']=payload['interval_ms']
+            context['execution_costs']={'taker_rate':dataset['fee']['taker_rate'],
+                'half_spread_rate':dataset['slippage_rate'],
+                'funding_rate_hourly':dataset.get('execution_quote',{}).get('funding_rate_hourly',0.) if dataset['market']['type']=='perp' else 0.}
+            context['training_history']=(history if training_cutoff is None else history[history['available_at']<=training_cutoff]).copy(deep=True)
             for category in ORDER:
                 fn=namespace.get('stage_'+category)
                 if not callable(fn):
@@ -86,6 +93,8 @@ def evaluate(payload):
             previous=target
             net.append(r)
             curve.append({'time':int(nxt['time']),'equity':equity,'drawdown':1-equity/peak})
+        if context.get('model_artifact'):
+            model_artifacts.append({'market':dataset['market']['id'],**copy.deepcopy(context['model_artifact'])})
         # Close final positions; include exit fees and slippage.
         exit_cost=abs(previous)*(dataset['fee']['taker_rate']+dataset['slippage_rate'])
         fees_total+=equity*abs(previous)*dataset['fee']['taker_rate']
@@ -108,7 +117,9 @@ def evaluate(payload):
     sharpe=float(np.mean(rets)/std*math.sqrt(bars_per_year)) if std>1e-12 else 0.
     # Avoid infinities and misleading huge values in JSON and objective arithmetic.
     sharpe=max(-100.,min(100.,sharpe))
-    metrics={'net_income':float(combined[-1]-cfg['initial_capital']),'return':float(combined[-1]/cfg['initial_capital']-1),'max_drawdown':float(max(dd)),'sharpe':sharpe,'bars':len(rets),'elapsed_seconds':time.monotonic()-started,'startup_seconds':startup_seconds,'replay_seconds':time.monotonic()-replay_started,'fees':sum(r['fees'] for r in results),'funding':sum(r['funding'] for r in results)}
+    metrics={'net_income':float(combined[-1]-cfg['initial_capital']),'return':float(combined[-1]/cfg['initial_capital']-1),'max_drawdown':float(max(dd)),'sharpe':sharpe,'bars':len(rets),'elapsed_seconds':time.monotonic()-started,'startup_seconds':startup_seconds,'replay_seconds':time.monotonic()-replay_started,'model_fit_count':sum(len(m.get('fit_events',[])) for m in model_artifacts),'fees':sum(r['fees'] for r in results),'funding':sum(r['funding'] for r in results)}
     equity_curve=[{'time':curves[0][i]['time'],'equity':float(value),'drawdown':float(dd[i])} for i,value in enumerate(combined)]
     executed['cells'][-1]['outputs'].append(nbformat.v4.new_output('display_data',data={'text/plain':json.dumps(metrics,indent=2),'application/json':metrics}))
-    return {'metrics':metrics,'curve':equity_curve,'markets':results,'notebook':dict(executed),'assumptions':['Equal-capital independent sleeves; gross exposure capped at 1x.','Next-open fills; snapshotted fee tier, hourly funding and observed spread held constant across replay.','No intrabar order-book queue, market impact or liquidation simulation.']}
+    if model_artifacts:
+        executed['cells'][-1]['outputs'].append(nbformat.v4.new_output('display_data',data={'text/plain':json.dumps(model_artifacts,indent=2),'application/json':{'models':model_artifacts}}))
+    return {'models':model_artifacts,'metrics':metrics,'curve':equity_curve,'markets':results,'notebook':dict(executed),'assumptions':['Equal-capital independent sleeves; gross exposure capped at 1x.','Final holdout supplies a fixed pre-embargo training_history; the strategy must honor this fit boundary.','Next-open fills; snapshotted fee tier, hourly funding and observed spread held constant across replay.','No intrabar order-book queue, market impact or liquidation simulation.']}

@@ -20,7 +20,7 @@ def node(nid,parent,category,summary,hypothesis='',kind='hypothesis',eval_parent
 def create(config,cid=None,initial_status="starting"):
     cfg=CampaignConfig.model_validate(config).model_dump()
     cid=cid or uuid.uuid4().hex[:12]
-    nodes=[node('baseline',None,None,'Baseline momentum trading pipeline',kind='baseline',eval_parent=None)]
+    nodes=[node('baseline',None,None,'Baseline research pipeline',kind='baseline',eval_parent=None)]
     for key,name,description in CATEGORIES:
         nodes.append(node('category-'+key,'baseline',key,name,description,kind='category'))
     c={'id':cid,'created_at':time.time(),'name':cfg['name'],'config':cfg,'status':initial_status,'phase':'prepare','step':0,'seed':int(cid[:8],16),'nodes':nodes,'active_node':'baseline','llm_spent':0.,'tokens_spent':0,'evaluation_spent':0.,'explored':0,'pareto':[],'best':None,'holdout':None,'error':None,'calibration':None,'dataset_ids':[],'merge_queue':[],'pause_requested':False,'stop_requested':False,'final_reason':None,'selected':None,'model_version':None}
@@ -36,8 +36,8 @@ def persist(c,message=None,kind='step'):
     # Budget ledgers can change while an LLM/evaluation activity runs. Never overwrite their newer values.
     with store.transaction() as db:
         current=store.load(c['id'],db)
-        for key in ['llm_spent','tokens_spent','evaluation_spent','pause_requested','stop_requested','llm_cost_known']:
-            c[key]=current.get(key,True) if key=='llm_cost_known' else current[key]
+        for key in ['llm_spent','tokens_spent','evaluation_spent','pause_requested','stop_requested','llm_cost_known','evaluation_reserved']:
+            c[key]=current.get(key,True) if key=='llm_cost_known' else current.get(key,0) if key=='evaluation_reserved' else current[key]
         c['step']+=1
         c['error']=None
         if c['status'] not in {'completed','stopped'}:
@@ -109,8 +109,11 @@ def datasets(c,holdout=False,calibrate=False):
             rows=d['records']
             split=int(len(rows)*(1-cfg['holdout_fraction']))
             if holdout:
-                # Warmup is supplied exclusively to the final frozen artifact, never used in holdout selection.
-                d['records']=rows[max(0,split-64):]
+                # The frozen artifact can fit on pre-embargo data and warm indicators on
+                # completed history. The full holdout stays excluded from fitting.
+                d['records']=rows
+                d['evaluation_start']=split
+                d['training_cutoff']=int(rows[split-cfg['embargo_bars']-1]['available_at'])
             else:
                 end=split-cfg['embargo_bars']
                 if calibrate:
@@ -136,6 +139,7 @@ async def run_evaluation(c,n,holdout=False,calibrate=False):
         if allotted is not None and (allotted<1 or (not holdout and not calibrate and allotted<expected)):
             raise provider.BudgetExhausted('Evaluation budget preserves the final holdout reservation.')
         latest['evaluation_spent']+=allotted or 0
+        latest['evaluation_reserved']=allotted or 0
         store.save(latest,db)
     selected_datasets=datasets(c,holdout,calibrate)
     cutoff=max(d['records'][-1]['available_at'] for d in selected_datasets)
@@ -150,16 +154,18 @@ async def run_evaluation(c,n,holdout=False,calibrate=False):
         with store.transaction() as db:
             latest=store.load(c['id'],db)
             latest['evaluation_spent']-=(allotted or 0)-elapsed
+            latest['evaluation_reserved']=0
             store.save(latest,db)
         raise ValueError('Notebook evaluation failed: '+r.text[-3000:])
     result=r.json()
     elapsed=min(allotted,time.monotonic()-started) if allotted is not None else time.monotonic()-started
-    evaluated_ref=notebooks.commit(c['id'],n['id'],n['attempt'],result.pop('notebook'),'holdout' if holdout else 'calibrated' if calibrate else 'evaluated')
+    evaluated_ref=notebooks.commit(c['id'],n['id'],n['attempt'],result.pop('notebook'),'holdout' if holdout else 'calibrated' if calibrate else 'evaluated',base=n['notebook'])
     result['notebook']=evaluated_ref
     with store.transaction() as db:
         # Result and budget settlement commit together. Retry returns the same result.
         latest=store.load(c['id'],db)
         latest['evaluation_spent']-=(allotted or 0)-elapsed
+        latest['evaluation_reserved']=0
         store.save(latest,db)
         db.execute('INSERT OR REPLACE INTO cache VALUES(?,?)',(key,json.dumps(result)))
         db.execute('INSERT OR REPLACE INTO outbox(id,body) VALUES(?,?)',(key,json.dumps({'type':'evaluation','campaign':c['id'],'node':n['id'],'holdout':holdout,'calibrate':calibrate,'result':result})))
@@ -171,41 +177,95 @@ def summary(value,fallback):
 
 async def seed_hypotheses(c):
     if c['config']['mode']=='demo':
-        hypotheses=[{'category':key,'summary':f'Refine {name.lower()} behavior','hypothesis':f'Test a conservative change to {description.lower()}.'} for key,name,description in CATEGORIES]
+        baseline=notebooks.read(c['id'],getnode(c,'baseline')['notebook'])
+        hypotheses=[{'category':key,**demo_hypothesis(key,baseline)} for key,_,_ in CATEGORIES]
     else:
-        result=await provider.agent(c['id'],'initial-research','researcher',{'task':'initial hypotheses','user_prompt':c['config']['prompt'],'categories':CATEGORIES,'baseline_metrics':getnode(c,'baseline')['metrics'],'baseline_notebook':notebooks.read(c['id'],getnode(c,'baseline')['notebook'])})
+        result=await provider.agent(c['id'],'initial-research','initializer',{'task':'initial hypotheses','user_prompt':c['config']['prompt'],'categories':CATEGORIES,'baseline_metrics':getnode(c,'baseline')['metrics'],'baseline_notebook':notebooks.read(c['id'],getnode(c,'baseline')['notebook'])})
         hypotheses=result.get('hypotheses',[])
     by_category={h['category']:h for h in hypotheses if h.get('category') in {k for k,_,_ in CATEGORIES}}
     if len(by_category)!=12:
-        raise ValueError('Initial researcher must return one hypothesis per category.')
+        raise ValueError('Pool initializer must return one hypothesis per category.')
     for key,name,_ in CATEGORIES:
         h=by_category[key]
         n=node('h-'+key,'category-'+key,key,summary(h.get('summary'),f'Investigate {name.lower()} improvements'),h['hypothesis'])
         n['base_notebook']=getnode(c,'baseline')['notebook']
+        if c['config']['mode']=='demo':n['demo_variant']=h['summary']
         n['sources']=[]
         c['nodes'].append(n)
     c['phase']='select'
     persist(c,'Twelve research branches initialized from the campaign prompt.','research')
 
-def demo_patch(c,n,parent):
-    key=n['category']
+# Each sandbox hypothesis names an edit that the developer can actually apply.
+DEMO_EDITS={
+    'sources': [('Count available point-in-time source feeds','return state','state["source_count"] = len(state.get("sources", {}))\n    return state')],
+    'quality': [('Tighten maximum candle gap tolerance','<= 1.5 * interval','<= 1.25 * interval'),('Require consecutive candle timestamps','<= 1.25 * interval','<= 1.0 * interval')],
+    'state': [('Extend short volatility lookback','returns.tail(24)','returns.tail(36)'),('Smooth recent volatility estimates further','returns.tail(36)','returns.tail(48)'),('Extend trailing volatility window','.tail(24)','.tail(36)')],
+    'models': [('Increase initial ridge regularization','alpha = 10.0','alpha = 30.0'),('Test stronger ridge penalty grid','[1.0, 10.0, 100.0]','[3.0, 30.0, 300.0]'),('Shorten momentum forecast lookback','close.iloc[-window]','close.iloc[-max(3, window // 2)]')],
+    'signals': [('Widen forecast uncertainty entry band','0.10 * state.get','0.20 * state.get'),('Require stronger forecast confidence','0.20 * state.get','0.30 * state.get'),('Lower forecast uncertainty entry band','0.10 * state.get','0.05 * state.get'),('Raise minimum momentum entry threshold','threshold = 0.002','threshold = 0.004')],
+    'sizing': [('Reduce annual volatility sizing target','annual_volatility_target = 0.15','annual_volatility_target = 0.10'),('Widen minimum allocation change band','< 0.03:','< 0.05:'),('Increase annual volatility sizing target','annual_volatility_target = 0.15','annual_volatility_target = 0.20'),('Lower position allocation multiplier','*= 0.35','*= 0.25')],
+    'exposure': [('Lower maximum sleeve exposure','min(0.8, state.get','min(0.5, state.get'),('Further cap individual market exposure','min(0.5, state.get','min(0.35, state.get'),('Tighten long and short exposure','max(-0.8, min(0.8','max(-0.5, min(0.5')],
+    'risk': [('Tighten maximum drawdown breaker','> 0.15','> 0.08'),('Halt trading at five percent drawdown','> 0.08','> 0.05')],
+    'retraining': [('Shorten rolling model training history','["training_days"] = 90','["training_days"] = 60'),('Expand momentum model training window','["training_window"] = 24','["training_window"] = 36')],
+    'drift': [('React sooner to volatility shifts','> 2.0','> 1.5'),('Lower feature outlier tolerance','> 0.2:', '> 0.1:'),('Lower volatility drift threshold','> 0.08','> 0.025')],
+    'registry': [('Tag candidate model artifact version','baseline-ml-v2','candidate-ml-v2'),('Tag candidate pipeline version','baseline-v1','candidate-v2')],
+}
+DEMO_METADATA={
+    'sources': ('Track latest source publication time','latest_source_publication','max([row["available_at"] for rows in state.get("sources", {}).values() for row in rows], default=0)'),
+    'quality': ('Record count of validated candles','validated_candles','len(history)'),
+    'storage': ('Record historical window start timestamp','history_start','int(history["time"].iloc[0])'),
+    'state': ('Record recent realized return dispersion','realized_dispersion','float(history["close"].pct_change().tail(12).std())'),
+    'models': ('Record absolute model forecast magnitude','absolute_forecast','abs(state.get("forecast", 0.0))'),
+    'signals': ('Record minimum forecast entry threshold','signal_entry_band','state.get("entry_threshold", 0.0)'),
+    'sizing': ('Record absolute proposed sleeve allocation','absolute_allocation','abs(state.get("target", 0.0))'),
+    'exposure': ('Record unused sleeve exposure capacity','exposure_headroom','max(0.0, state.get("max_exposure", 1.0) - abs(state.get("target", 0.0)))'),
+    'risk': ('Record current drawdown risk utilization','drawdown_utilization','state.get("drawdown", 0.0) / 0.15'),
+    'retraining': ('Record configured model update interval','configured_update_interval','state.get("retrain_interval_ms", 0)'),
+    'drift': ('Record current feature outlier fraction','drift_outlier_fraction','state.get("feature_outlier_fraction", 0.0)'),
+    'registry': ('Record fitted model version metadata','registered_model_version','state.get("pipeline_version", "unversioned")'),
+}
+
+def demo_options(key,parent,include_metadata=False):
     cell=next(x for x in parent['cells'] if x['id']==key)
     src=notebooks.source(cell)
-    variants={
-        'sources':('return state','state["source_count"] = len(state.get("sources", {}))\n    return state'),
-        'quality':('return state','state["quality_checked"] = True\n    return state'),
-        'storage':('return state','state["lineage_version"] = "point-in-time-v2"\n    return state'),
-        'state':('.tail(24)','.tail(36)'),
-        'models':('close.iloc[-window]','close.iloc[-max(3, window // 2)]'),
-        'signals':('threshold = 0.002','threshold = 0.004'),
-        'sizing':('*= 0.35','*= 0.5'),
-        'exposure':('max(-0.8, min(0.8','max(-0.5, min(0.5'),
-        'risk':('> 0.15','> 0.08'),
-        'retraining':('= 24','= 36'),
-        'drift':('> 0.08','> 0.025'),
-        'registry':('baseline-v1','candidate-v2')}
-    a,b=variants[key]
-    return {'summary':n['summary'],'cells':{key:src.replace(a,b)},'sources':[]}
+    for label,before,after in DEMO_EDITS.get(key,[]):
+        if before in src and after not in src:
+            yield label,src.replace(before,after,1)
+    if include_metadata:
+        label,field,value=DEMO_METADATA[key]
+        if f'state["{field}"]' not in src:
+            alias=f'demo_{key}_{notebooks.fingerprint(src)[:12]}'
+            patch=f'\n{alias} = stage_{key}\n\ndef stage_{key}(history, state):\n    state = {alias}(history, state)\n    state["{field}"] = {value}\n    return state\n'
+            yield label,src+patch
+
+def demo_hypothesis(key,parent):
+    plan=next(demo_options(key,parent,include_metadata=True),None)
+    label=plan[0] if plan else f'Check {key} stage configuration'
+    return {'summary':label,'hypothesis':f'{label} and compare against the evaluated input using the same data and costs.'}
+
+def tried_demo_variants(c,key,except_id=None):
+    return {n.get('demo_variant',n['summary']) for n in c.get('nodes',[]) if n['category']==key and n['id']!=except_id}
+
+def demo_patch(c,n,parent):
+    key=n['category']
+    initial=n['parent']=='category-'+key and not n.get('proposed_by')
+    used=tried_demo_variants(c,key,n['id'])
+    plans=[p for p in demo_options(key,parent,include_metadata=initial) if p[0] not in used]
+    plan=next((p for p in plans if p[0]==n.get('demo_variant')),None) or (plans[0] if plans else None)
+    if plan is None:
+        return None
+    label,source=plan
+    return {'summary':label,'cells':{key:source},'sources':[]}
+
+def demo_followup(c,n,current,comparison):
+    used=tried_demo_variants(c,n['category'])
+    choices=[('child',current),('sibling',comparison)]
+    if n['reward']<=0:
+        choices.reverse()
+    for placement,base in choices:
+        for label,_ in demo_options(n['category'],base):
+            if label not in used:
+                return {'placement':placement,'summary':label,'hypothesis':f'{label} and compare using the same data and costs. The triggering experiment gained {n["reward"]:+.4f}.'}
+    return {'placement':'none'}
 
 async def develop(c,n):
     parent=notebooks.read(c['id'],n.get('base_notebook') or getnode(c,n['eval_parent'])['notebook'])
@@ -216,6 +276,13 @@ async def develop(c,n):
             response={'cells':{x['id']:notebooks.source(x) for x in parent['cells'] if x['cell_type']=='code'}}
         else:
             response=demo_patch(c,n,parent)
+            if response is None:
+                n['status']='rejected'
+                n['feedback']='No untried sandbox edit remains for this input notebook.'
+                c['phase']='select'
+                persist(c,f"Skipped exhausted sandbox hypothesis {n['id']}.",'research')
+                return
+            n['demo_variant']=response['summary']
     else:
         payload={'task':'semantic merge' if merge else 'implement hypothesis','hypothesis':n['hypothesis'],'allowed_category':'all category cells' if merge else n['category'],'notebook':parent,'parent_metrics':getnode(c,n['eval_parent']).get('metrics'),'feedback':n.get('feedback'),'user_prompt':c['config']['prompt'],'compute_profile':c['calibration'],'evaluation_target_seconds':c['config']['evaluation_seconds']}
         if merge:
@@ -225,7 +292,7 @@ async def develop(c,n):
         candidate=notebooks.apply_patch(parent,response,n['category'],merge)
     except ValueError as exc:
         # An invalid developer response still produces a preserved failed attempt and bounded repair feedback.
-        n['notebook']=notebooks.commit(c['id'],n['id'],n['attempt'],parent,'invalid-response')
+        n['notebook']=notebooks.commit(c['id'],n['id'],n['attempt'],parent,'invalid-response',base=n.get('base_notebook'))
         n['feedback']=str(exc)+' Return a non-empty cells map with replacement Python source.'
         if not c['config']['critic_retries'] or n['attempt']<c['config']['critic_retries']:
             n['attempt']+=1
@@ -235,7 +302,8 @@ async def develop(c,n):
             search.backpropagate(c,n,0.)
         persist(c,f"Invalid developer output for {n['id']}; feedback saved.",'rejected')
         return
-    n['notebook']=notebooks.commit(c['id'],n['id'],n['attempt'],candidate,'draft')
+    n['summary']=summary(response.get('summary'),n['summary'])
+    n['notebook']=notebooks.commit(c['id'],n['id'],n['attempt'],candidate,'draft',base=n.get('base_notebook'))
     n['status']='reviewing'
     n['source_requests']=response.get('sources',[])
     c['phase']='critic'
@@ -246,6 +314,8 @@ async def critic(c,n):
     candidate=notebooks.read(c['id'],n['notebook'])
     try:
         notebooks.validate(candidate,parent,n['category'],n['kind']=='merge')
+        if n['kind']!='merge' and not n['source_requests'] and not notebooks.code_changed(parent,candidate):
+            raise ValueError('The proposed edit does not change executable notebook code or add a data source.')
         if n['source_requests'] and n['category']!='sources' and n['kind']!='merge':
             raise ValueError('Additional sources may only be introduced in Sources and ingestion or a merge.')
         if c['config']['mode']=='demo':
@@ -317,22 +387,46 @@ async def evaluate_node(c,n):
                 c['nodes'].append(m)
                 c['merge_queue'].append(mid)
     if n['kind']=='merge':
-        refs=[getnode(c,p)['notebook']['sha'] for p in n['merge_parents']]
+        # Keep the evaluated merge attempt in the first-parent history and link the other input.
+        refs=[n['notebook']['sha'],getnode(c,n['merge_parents'][0])['notebook']['sha']]
         n['notebook']=notebooks.commit(c['id'],n['id'],n['attempt'],notebooks.read(c['id'],n['notebook']),'merged',refs)
     c['phase']='research' if n['kind']!='merge' else 'select'
     persist(c,f"{n['id']} scored {n['score']:.4f}; parent gain {n['reward']:+.4f}.",'evaluation')
 
 async def research(c,n):
+    comparison=getnode(c,n['eval_parent'])
+    current_nb=notebooks.read(c['id'],n['notebook'])
+    comparison_nb=notebooks.read(c['id'],comparison['notebook'])
     if c['config']['mode']=='demo':
-        h={'summary':'Adapt pipeline to observed volatility','hypothesis':f"Refine {n['category']} using only historical volatility; test against this evaluated parent."}
+        h=demo_followup(c,n,current_nb,comparison_nb)
     else:
-        h=await provider.agent(c['id'],f"{n['id']}:research",'researcher',{'task':'Propose one child hypothesis within the SAME category based on evaluation evidence.','category':n['category'],'hypothesis':n['hypothesis'],'metrics':n['metrics'],'parent_gain':n['reward'],'notebook':notebooks.read(c['id'],n['notebook']),'user_prompt':c['config']['prompt']})
-    child=node('h-'+notebooks.fingerprint([n['id'],'research-child'])[:12],n['id'],n['category'],summary(h.get('summary'),'Refine pipeline using evaluation evidence'),h['hypothesis'],eval_parent=n['id'])
-    child['base_notebook']=n['notebook']
-    child['sources']=n.get('sources',[])
-    c['nodes'].append(child)
+        alternatives=[{'summary':x['summary'],'hypothesis':x['hypothesis'],'status':x['status'],'gain':x['reward']}
+                      for x in c['nodes'] if x['kind']=='hypothesis' and x['category']==n['category'] and x['id']!=n['id']][-24:]
+        h=await provider.agent(c['id'],f"{n['id']}:research",'researcher',{
+            'task':'Propose one distinct experiment in the same category. Choose child to build on the evaluated notebook, sibling to try an alternative from its comparison parent, or none if there is no new test. Avoid repeated or tracking-only edits that do not test a hypothesis.',
+            'category':n['category'],'hypothesis':n['hypothesis'],'metrics':n['metrics'],'parent_gain':n['reward'],
+            'notebook':current_nb,'comparison_parent':{'id':comparison['id'],'metrics':comparison['metrics'],
+                'category_source':notebooks.source(next(cell for cell in comparison_nb['cells'] if cell['id']==n['category']))},
+            'nearby_hypotheses':alternatives,'user_prompt':c['config']['prompt']})
+    placement=h.get('placement')
+    hypothesis=h.get('hypothesis')
     c['phase']='select'
-    persist(c,f"Researcher proposed a child of {n['id']}.",'research')
+    if placement not in ('child','sibling') or not isinstance(hypothesis,str) or not hypothesis.strip():
+        persist(c,f"Researcher proposed no further experiment for {n['id']}.",'research')
+        return
+    target=n if placement=='child' else comparison
+    tree_parent=n['id'] if placement=='child' else n['parent']
+    fingerprint=lambda text:' '.join(text.casefold().split()).strip(' .!?')
+    label=summary(h.get('summary'),summary(hypothesis,f"Test alternative {n['category']} configuration"))
+    if any(x['category']==n['category'] and x['kind']=='hypothesis' and (
+            fingerprint(x['hypothesis'])==fingerprint(hypothesis) or fingerprint(x['summary'])==fingerprint(label)) for x in c['nodes']):
+        persist(c,f"Researcher skipped a repeated proposal for {n['id']}.",'research')
+        return
+    followup=node('h-'+notebooks.fingerprint([n['id'],'research-'+placement])[:12],tree_parent,n['category'],label,hypothesis.strip(),eval_parent=target['id'])
+    followup.update(base_notebook=target['notebook'],sources=copy.deepcopy(target.get('sources',[])),proposed_by=n['id'],proposal_placement=placement)
+    if c['config']['mode']=='demo':followup['demo_variant']=label
+    c['nodes'].append(followup)
+    persist(c,f"Researcher proposed a {placement} of {n['id']}.",'research')
 
 async def finalize(c):
     # Selection is written BEFORE opening the holdout. Retries never select based on holdout results.
@@ -379,21 +473,23 @@ async def step(cid):
             live=store.load(cid)
             expected,reserve=compute_estimates(live)
             limit=reached(c['explored'],c['config']['max_nodes']) or (c['config']['evaluation_budget_seconds'] and live['evaluation_spent']+expected+reserve>c['config']['evaluation_budget_seconds']) or reached(live['llm_spent'],c['config']['llm_budget_usd']) or reached(live['tokens_spent'],c['config']['llm_token_budget'])
-            nid=None if limit else (c['merge_queue'].pop(0) if c['merge_queue'] else search.select(c))
+            epsilon=search.temperature(live)
+            priority_merge=bool(c['merge_queue'])
+            nid=None if limit else (c['merge_queue'].pop(0) if priority_merge else search.select(c,epsilon))
             if not nid:
                 c['final_reason']='Search limit reached' if limit else 'Hypothesis frontier exhausted'
                 c['selected']=c['best']; c['selection_frozen_at']=time.time(); c['phase']='finalize'
                 persist(c,'Search ended; final model selection frozen before holdout.','campaign')
             else:
                 n=getnode(c,nid)
-                # Unexplored children inherit the latest evaluated champion without changing their tree ancestry.
-                # Reward is still measured against the original evaluated hypothesis parent.
-                if n['kind']!='merge' and c['best']!=n['eval_parent']:
+                # Explicit follow-ups test their chosen parent. Only initial live seeds may inherit the champion.
+                if c['config']['mode']=='live' and n['kind']=='hypothesis' and not n.get('proposed_by') and n['parent']=='category-'+str(n['category']) and c['best']!=n['eval_parent']:
                     n['inherited_from']=c['best']
                     n['base_notebook']=getnode(c,c['best'])['notebook']
                     n['sources']=getnode(c,c['best']).get('sources',[])
                 n['status']='developing'; c['active_node']=nid; c['phase']='develop'
-                persist(c,f"Selected {nid} at exploration {search.temperature(live):.3f}.",'selection')
+                c['selection']={'node':nid,'temperature':epsilon,'mode':'merge' if priority_merge else 'search'}
+                persist(c,f"Selected {nid} from the merge queue." if priority_merge else f"Selected {nid} at exploration {epsilon:.3f}.",'selection')
         elif phase=='develop':
             await develop(c,getnode(c,c['active_node']))
         elif phase=='critic':

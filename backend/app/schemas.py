@@ -27,12 +27,11 @@ class CampaignConfig(BaseModel):
     max_gross_exposure: float = Field(default=1, gt=0, le=1)
     model: str = ''
     reasoning: str | None = Field(default=None, max_length=128)
-    agents: dict[Literal['developer','researcher','critic'], AgentConfig] = Field(default_factory=dict)
+    agents: dict[Literal['developer','researcher','critic','initializer'], AgentConfig] = Field(default_factory=dict)
     execution_snapshot_id: str = ''
     wallet_address: str = ''
     baseline: str = 'baseline.ipynb'
     registry_name: str = ''
-    production_interval_hours: int = Field(default=24, ge=1, le=720)
 
     @model_validator(mode='after')
     def valid_constraints(self):
@@ -47,3 +46,9 @@ class CampaignConfig(BaseModel):
 class ProviderConfig(BaseModel):
     base_url: str
     api_key: str = ''
+
+
+class RefreshScheduleRequest(BaseModel):
+    campaign: str
+    interval_hours: int = Field(ge=1, le=720)
+    max_runs: int = Field(default=3, ge=0, le=100)

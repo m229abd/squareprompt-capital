@@ -6,7 +6,7 @@ TERMINAL = {'completed','negative','rejected','failed'}
 
 def temperature(c):
     cfg=c['config']
-    progress=max(fraction(c['llm_spent'],cfg['llm_budget_usd']), fraction(c['tokens_spent'],cfg['llm_token_budget']), fraction(c['evaluation_spent'],cfg['evaluation_budget_seconds']), fraction(c['explored'],cfg['max_nodes']))
+    progress=max(fraction(c['llm_spent'],cfg['llm_budget_usd']), fraction(c['tokens_spent'],cfg['llm_token_budget']), fraction(max(0,c['evaluation_spent']-c.get('evaluation_reserved',0)),cfg['evaluation_budget_seconds']), fraction(c['explored'],cfg['max_nodes']))
     return max(0., min(1., 1-progress))
 
 def score(metrics, objective):
@@ -19,37 +19,35 @@ def pareto(nodes):
         return am['return']>=bm['return'] and am['max_drawdown']<=bm['max_drawdown'] and am['sharpe']>=bm['sharpe'] and (am['return']>bm['return'] or am['max_drawdown']<bm['max_drawdown'] or am['sharpe']>bm['sharpe'])
     return [n['id'] for n in eligible if not any(dominates(o,n) for o in eligible if o['id']!=n['id'])]
 
-def select(c):
-    """Descend the tree with annealed epsilon-greedy UCT; unvisited children tie uniformly."""
+def select(c, epsilon=None):
+    """Mix uniform frontier sampling with reward-guided tree descent."""
     nodes={n['id']:n for n in c['nodes']}
     frontier=[n for n in c['nodes'] if n['status']=='queued' and n['kind']!='category']
     if not frontier:
         return None
+    epsilon=temperature(c) if epsilon is None else epsilon
+    rng=random.Random(c['seed']+c['step'])
+    if rng.random()<epsilon:
+        return rng.choice(frontier)['id']
     paths=set()
     for node in frontier:
         cur=node
         while cur:
             paths.add(cur['id'])
             cur=nodes.get(cur.get('parent'))
-    rng=random.Random(c['seed']+c['step'])
     current=nodes['baseline']
     while current['status']!='queued':
         children=[n for n in c['nodes'] if n.get('parent')==current['id'] and n['id'] in paths]
         if not children:
             return None
-        unvisited=[n for n in children if n.get('visits',0)==0]
-        if unvisited:
-            current=rng.choice(unvisited)
-        elif rng.random()<temperature(c):
-            current=rng.choice(children)
-        else:
-            def uct(n):
-                v=n.get('visits',1)
-                # Mean reward is normalized locally so dollar objectives cannot swamp UCT.
-                means=[x.get('value',0)/max(1,x.get('visits',0)) for x in children]
-                scale=max(1e-8,max(abs(x) for x in means))
-                return n.get('value',0)/v/scale+math.sqrt(2*math.log(max(2,current.get('visits',1)))/v)
-            current=max(children,key=uct)
+        means=[n.get('value',0)/max(1,n.get('visits',0)) for n in children]
+        scale=max(1e-8,max(abs(x) for x in means))
+        def rank(n):
+            visits=n.get('visits',0)
+            mean=n.get('value',0)/max(1,visits)
+            bonus=math.sqrt(2*math.log(max(2,current.get('visits',1)))/max(1,visits))
+            return (mean/scale+epsilon*bonus,n['id'])
+        current=max(children,key=rank)
     return current['id']
 
 def backpropagate(c, node, reward):

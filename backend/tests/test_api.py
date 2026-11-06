@@ -52,3 +52,60 @@ def test_budgets_cannot_be_lowered_mid_campaign(client):
     accepted=client.patch('/api/campaigns/'+c['id']+'/budgets',json={'llm_budget_usd':20})
     assert accepted.status_code==200
     assert accepted.json()['config']['llm_budget_usd']==20
+
+
+
+def test_overview_keeps_chart_curves_and_only_dataset_metadata(client):
+    c=engine.create({'markets':['BTC'],'prompt':'Verify lean dashboard polling'})
+    base=engine.getnode(c,'baseline');base['curve']=[{'time':1,'equity':100}]
+    winner=engine.node('winner','baseline','models','Increase model regularization strength')
+    winner['curve']=[{'time':1,'equity':102}]
+    other=engine.node('other','baseline','models','Adjust model regularization strength')
+    other['curve']=[{'time':1,'equity':98}]
+    c['nodes'] += [winner,other];c['best']='winner'
+    with store.transaction() as db:
+        store.save(c,db)
+        db.execute('INSERT INTO cache VALUES(?,?)',('demo-test',json.dumps({'id':'demo-test','records':[{'close':1}],'bytes':18})))
+    body=client.get('/api/overview').json()
+    nodes={n['id']:n for n in body['campaigns'][0]['nodes']}
+    assert nodes['baseline']['curve']==base['curve']
+    assert nodes['winner']['curve']==winner['curve']
+    assert 'curve' not in nodes['other']
+    assert body['datasets']==[{'id':'demo-test','bytes':18}]
+    assert engine.getnode(store.load(c['id']),'other')['curve']==other['curve']
+
+
+def test_overview_only_loads_selected_campaign_detail(client):
+    older=engine.create({'markets':['BTC'],'prompt':'Open this campaign detail'})
+    latest=engine.create({'markets':['ETH'],'prompt':'Keep this campaign in the list'})
+    for c in (older,latest):
+        c['best']='baseline'
+        c['holdout']={'metrics':{'return':.1},'curve':[{'time':1,'equity':110}]}
+        engine.getnode(c,'baseline').update(metrics={'sharpe':.5},curve=[{'time':1,'equity':102}])
+        with store.transaction() as db:store.save(c,db)
+    body=client.get('/api/overview',params={'campaign_id':older['id']}).json()
+    views={c['id']:c for c in body['campaigns']}
+    assert len(views[older['id']]['nodes'])==13
+    assert 'curve' in views[older['id']]['nodes'][0]
+    assert len(views[latest['id']]['nodes'])==1
+    assert views[latest['id']]['nodes'][0]['metrics']['sharpe']==.5
+    assert 'curve' not in views[latest['id']]['nodes'][0]
+    assert 'curve' not in views[latest['id']]['holdout']
+
+
+def test_suggested_history_reads_pilot_metadata_and_respects_split(client):
+    c=engine.create({'markets':['BTC'],'prompt':'Measure history suggestion without reading replay'})
+    c['calibration']={'seconds_per_portfolio_bar':.01,'startup_seconds':3}
+    with store.transaction() as db:store.save(c,db)
+    r=client.get('/api/evaluation-defaults',params={'target_seconds':15,'holdout_fraction':.3,'embargo_bars':12})
+    assert r.status_code==200
+    result=r.json()
+    assert result['reference_campaign']==c['id']
+    assert int(result['bars']*.7)-64-12>=1200
+    assert client.get('/api/evaluation-defaults?target_seconds=0').json()['bars']==4900
+
+
+def test_refresh_requires_an_explicit_interval(client):
+    response=client.post('/api/schedules',json={'campaign':'test-campaign'})
+    assert response.status_code==422
+    assert any(error['loc']==['body','interval_hours'] for error in response.json()['detail'])

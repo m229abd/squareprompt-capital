@@ -4,6 +4,20 @@ import math
 WARMUP=64
 MIN_SCORED_BARS=20
 
+def suggested_history(target_seconds,markets,holdout,embargo,reference=None):
+    if not target_seconds:
+        return 4900
+    if reference:
+        cost=reference['bar_seconds']*(markets/max(1,reference['market_count']))**2
+        # Bound before division/ceil even for an anomalously fast recorded pilot.
+        scored=min(4900,max(MIN_SCORED_BARS,int(max(0,target_seconds-reference['startup_seconds'])/max(cost,1e-9))))
+        bars=math.ceil((WARMUP+scored+embargo)/(1-holdout))
+    else:
+        bars=round(720*target_seconds/15/max(1,markets/3))
+    minimum=max(150,math.ceil(MIN_SCORED_BARS/holdout),math.ceil((WARMUP+MIN_SCORED_BARS+embargo)/(1-holdout)))
+    return min(4900,max(minimum,bars))
+
+
 def calibrate(config, metrics, markets):
     available=int(config['bars']*(1-config['holdout_fraction']))-config['embargo_bars']
     scored=max(1,int(metrics['bars']))

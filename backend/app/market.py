@@ -125,6 +125,11 @@ async def candles(market,cfg,end_ms):
         db.execute('INSERT OR REPLACE INTO cache VALUES(?,?)',(key,json.dumps(saved)))
     return saved
 
+def sandbox_instrument(symbol,market_type):
+    # Catalog spot IDs are @indices or slash-delimited pairs.
+    return 'spot' if market_type=='spot' or (market_type=='both' and (symbol.startswith('@') or '/' in symbol)) else 'perp'
+
+
 def synthetic(symbol,cfg,end_ms):
     rng=random.Random(int(hashlib.sha256(symbol.encode()).hexdigest()[:12],16))
     price={'BTC':68000,'SOL':160,'HYPE':25}.get(symbol,100)
@@ -135,7 +140,7 @@ def synthetic(symbol,cfg,end_ms):
         prev=price
         price*=math.exp(.00015+.001*math.sin(i/21)+rng.gauss(0,.008))
         rows.append({'time':start+i*interval,'available_at':start+(i+1)*interval,'open':prev,'close':price,'high':max(prev,price)*1.002,'low':min(prev,price)*.998,'volume':rng.uniform(100,2000),'funding':.00001 if i%8==0 else 0})
-    return {'id':'demo-'+fingerprint([symbol,cfg['bars'],start]),'market':{'id':symbol,'symbol':symbol,'type':'spot' if cfg['market_type']=='spot' else 'perp'},'records':rows,'downloaded_at':time.time(),'bytes':len(json.dumps(rows)),'start':rows[0]['time'],'end':rows[-1]['time'],'provenance':{'synthetic':True,'seed':symbol,'sha256':fingerprint(rows)}}
+    return {'id':'demo-'+fingerprint([symbol,cfg['bars'],start]),'market':{'id':symbol,'symbol':symbol,'type':sandbox_instrument(symbol,cfg['market_type'])},'records':rows,'downloaded_at':time.time(),'bytes':len(json.dumps(rows)),'start':rows[0]['time'],'end':rows[-1]['time'],'provenance':{'synthetic':True,'seed':symbol,'sha256':fingerprint(rows)}}
 
 async def download_source(request):
     """Managed JSON point-in-time source; no credentials, redirects, private IPs or executable downloads."""
@@ -179,7 +184,12 @@ async def execution_snapshot(config):
     import uuid
     rows=[]
     if config['mode']=='demo':
-        rows=[{'market':coin,'instrument':'spot' if config['market_type']=='spot' else 'perp','taker_rate':.00045,'funding_rate_hourly':0. if config['market_type']=='spot' else .00001,'spread_bps':2.,'half_spread_rate':.0001,'bid':None,'ask':None,'source':'Synthetic sandbox assumptions','fetched_at':time.time()} for coin in config['markets']]
+        for coin in config['markets']:
+            instrument=sandbox_instrument(coin,config['market_type'])
+            rows.append({'market':coin,'instrument':instrument,'taker_rate':.00045,
+                         'funding_rate_hourly':0. if instrument=='spot' else .00001,
+                         'spread_bps':2.,'half_spread_rate':.0001,'bid':None,'ask':None,
+                         'source':'Synthetic sandbox assumptions','fetched_at':time.time()})
     else:
         markets=await resolve_markets(config['markets'],config['market_type'])
         contexts={}

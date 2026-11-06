@@ -2,7 +2,10 @@
 services:
   opik-mysql:
     image: mysql:8.4.2
+    command: [--innodb-buffer-pool-size=64M, --performance-schema=OFF, --mysqlx=0, --max-connections=32]
     profiles: [opik]
+    mem_limit: 288m
+    cpus: 0.75
     restart: unless-stopped
     environment:
       MYSQL_ROOT_PASSWORD: opik
@@ -18,6 +21,8 @@ services:
   opik-redis:
     image: redis:7.2.4-alpine3.19
     profiles: [opik]
+    mem_limit: 48m
+    cpus: 0.25
     restart: unless-stopped
     command: redis-server --requirepass opik
     volumes: ['opik-redis:/data']
@@ -29,9 +34,11 @@ services:
   opik-zookeeper:
     image: zookeeper:3.9.4
     profiles: [opik]
+    mem_limit: 192m
+    cpus: 0.5
     restart: unless-stopped
     environment:
-      JVMFLAGS: '-Xmx256m'
+      JVMFLAGS: '-Xmx96m -XX:ActiveProcessorCount=2'
       ZOO_4LW_COMMANDS_WHITELIST: srvr,ruok
     volumes: ['opik-zookeeper:/data', 'opik-zookeeper-log:/datalog']
     healthcheck:
@@ -42,11 +49,15 @@ services:
   opik-clickhouse-init:
     image: node:22-alpine
     profiles: [opik]
+    mem_limit: 48m
+    cpus: 0.25
     volumes: ['./clickhouse_config:/source:ro', 'opik-clickhouse-config:/config']
     command: [sh, -c, 'cp /source/* /config/ && chown -R 1000:1000 /config']
   opik-clickhouse:
     image: clickhouse/clickhouse-server:25.3.6.56-alpine
     profiles: [opik]
+    mem_limit: 768m
+    cpus: 1
     restart: unless-stopped
     environment:
       CLICKHOUSE_DB: opik
@@ -65,28 +76,38 @@ services:
       opik-zookeeper: {condition: service_healthy}
       opik-clickhouse-init: {condition: service_completed_successfully}
   opik-minio:
-    image: minio/minio:RELEASE.2025-03-12T18-04-18Z
+    image: cloudpirates/image-minio:RELEASE.2025-10-15T17-29-55Z-hardened
     profiles: [opik]
+    mem_limit: 128m
+    cpus: 0.5
     restart: unless-stopped
     environment:
       MINIO_ROOT_USER: localopik
       MINIO_ROOT_PASSWORD: local-opik-research-only
-    command: server --console-address ':9090' /data
+      GOMEMLIMIT: 80MiB
+    entrypoint: [/usr/bin/minio]
+    command: [server, --console-address, ':9090', /data]
     volumes: ['opik-minio:/data']
     healthcheck:
-      test: [CMD, curl, -f, 'http://localhost:9000/minio/health/live']
+      test: [CMD, wget, --spider, -q, 'http://127.0.0.1:9000/minio/health/live']
       interval: 5s
       timeout: 3s
       retries: 60
   opik-mc:
-    image: minio/mc:RELEASE.2025-03-12T17-29-24Z
+    image: cloudpirates/image-minio:RELEASE.2025-10-15T17-29-55Z-hardened
     profiles: [opik]
+    mem_limit: 64m
+    cpus: 0.25
     depends_on:
       opik-minio: {condition: service_healthy}
+    environment:
+      MC_CONFIG_DIR: /tmp/.mc
     entrypoint: [sh, -c, 'mc alias set s3 http://opik-minio:9000 localopik local-opik-research-only && mc mb --ignore-existing s3/public']
   opik-backend:
     image: ghcr.io/comet-ml/opik/opik-backend:1.11.14
     profiles: [opik]
+    mem_limit: 640m
+    cpus: 1
     restart: unless-stopped
     command: [bash, -c, './run_db_migrations.sh && ./entrypoint.sh']
     environment:
@@ -104,7 +125,8 @@ services:
       ANALYTICS_DB_DATABASE_NAME: opik
       ANALYTICS_DB_USERNAME: opik
       ANALYTICS_DB_PASS: opik
-      JAVA_OPTS: '-Dliquibase.propertySubstitutionEnabled=true -XX:+UseG1GC -Xmx512m'
+      JAVA_OPTS: '-Dliquibase.propertySubstitutionEnabled=true -XX:+UseG1GC -Xmx384m'
+      JAVA_TOOL_OPTIONS: '-XX:ActiveProcessorCount=2 -XX:MaxDirectMemorySize=64m -XX:+ExitOnOutOfMemoryError'
       REDIS_URL: 'redis://:opik@opik-redis:6379/'
       OPIK_OTEL_SDK_ENABLED: 'false'
       OPIK_USAGE_REPORT_ENABLED: 'false'
@@ -128,9 +150,12 @@ services:
       opik-clickhouse: {condition: service_healthy}
       opik-minio: {condition: service_healthy}
       opik-redis: {condition: service_healthy}
+      opik-mc: {condition: service_completed_successfully}
   opik-ui:
     image: ghcr.io/comet-ml/opik/opik-frontend:1.11.14
     profiles: [opik]
+    mem_limit: 48m
+    cpus: 0.5
     restart: unless-stopped
     ports: ['127.0.0.1:5174:5174']
     volumes: ['./nginx_default_local.conf:/etc/nginx/templates/default.conf.template:ro']
