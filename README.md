@@ -2,7 +2,7 @@
 
 A Docker-hosted research lab for discovering cryptocurrency and tokenized-asset trading pipelines on Hyperliquid. It combines an annealed stochastic Monte Carlo tree search, versioned Jupyter notebooks, developer/critic/researcher agents, and durable Temporal workflows with a React + shadcn/ui interface.
 
-This release runs research campaigns and scheduled research refreshes. **It does not submit live orders.** The baseline is a causal ridge-regression pipeline with ten OHLCV features, cost-aware signals, volatility sizing and retraining every 14 elapsed market days. Campaigns can use either synthetic data or Hyperliquid data. Both data sources use LLM agents.
+This release runs research campaigns and scheduled research refreshes. **It does not submit live orders.** The baseline is a volatility-scaled ridge model with cost-aware signals, risk-based sizing and retraining every 14 elapsed market days. Campaigns can use either synthetic data or Hyperliquid data. Both data sources use LLM agents.
 
 ![Squareprompt Capital research workspace showing the hypothesis search tree and development performance chart](docs/research-workspace-screenshot.png)
 
@@ -113,13 +113,17 @@ docker compose up -d --no-build
 
 ### Bundled ML baseline
 
-`baseline.ipynb` fits a separate regularized return model for each market, using only completed candles and fully observed four-bar targets. It starts after 32 matured examples, then refits every 14 elapsed days on a trailing 90-day window capped at 2,048 examples. Scaling is fitted on training data; once 80 examples are available, a purged chronological training split selects ridge regularization. Coefficients remain fixed between updates.
+`baseline.ipynb` fits a separate model for each market. It predicts next-open to fourth-close returns in units of volatility known at the time of the decision. Twelve features describe momentum, trend efficiency, volatility, candle shape, volume and opening gaps. The first fit uses at least 32 matured targets and shrinks forecasts toward zero. With at least 96 targets, two chronological validation folds select the ridge penalty and estimate how much to shrink the forecast and how uncertain it is. The folds exclude training targets that overlap validation.
 
-The model predicts next-open to fourth-following-close returns. Entry bands include pinned round-trip fees/spread, adverse funding and forecast uncertainty. Annualized volatility sizing targets 15%, subject to an 0.8× sleeve cap and the campaign exposure cap. Small same-direction sizing changes are suppressed; a 15% sleeve drawdown latches its kill switch for the rest of that replay. Causal feature outliers or a volatility spike reduce exposure.
+The notebook refits every 14 elapsed days when additional training data is available. It uses up to 2,048 examples from the most recent 90 days or 256 bars, whichever covers more time, with more weight on recent examples. Separate entry and exit bands account for pinned round-trip costs, adverse funding and forecast uncertainty.
+
+Sizing starts from a 15% annualized volatility target and caps each sleeve using typical candle notional, trade counts and recent adverse funding. If trade counts are unavailable, sizing uses candle volume to measure activity. The exposure stage estimates each sleeve's beta and correlation to the other selected markets from aligned, completed candles. It lowers the sleeve's cap when the shared market trend moves against the position. Historical funding informs sizing, while replay fills use the campaign's frozen funding rate.
+
+The risk stage caps exposure against the larger of a three-sigma price move and the biggest recent move. It pauses after unusually large returns and latches a 2.5% sleeve loss until the next UTC day. It tapers exposure from a 3% drawdown and halts the sleeve at 15%.
 
 Final holdout predictions may use completed observations for indicators, but **fitting, scaling and parameter selection use only pre-embargo history**. The final model is initialized from this longer training prefix rather than a 64-bar warmup. Full holdout length and prior winner selection remain unchanged. Short calibration/search windows may contain no scheduled refit; they still run the initial fit, and longer windows exercise the same two-week update rule.
 
-Each fit's coefficients, scaler, chosen regularization, sample count, timestamps and uncertainty are retained in the evaluated notebook and MLflow `models.json`; TensorBoard records fit events. These artifacts are research models, and sandbox results do not measure live trading performance. The retraining cell is the single source of the model cadence. A research refresh starts a separate campaign only when you explicitly create a schedule and enter its interval.
+Each fit's coefficients, scaler, penalty, forecast calibration, sample count and timestamps are retained in the evaluated notebook and MLflow `models.json`. TensorBoard records fit events. The notebook's retraining cell controls the fit cadence. A research refresh starts a separate campaign only when you explicitly create a schedule and enter its interval.
 
 
 ### Development benchmarks

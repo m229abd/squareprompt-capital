@@ -244,9 +244,10 @@ async def test_weekly_candles_include_latest_close_and_align_funding(sandbox, mo
     week = 604_800_000
     boundary = (1_800_000_000_000 // week) * week
     candles = [
-        {'t': opening, 'T': opening + week - 1, 'o': '100', 'h': '101', 'l': '99', 'c': '100', 'v': '1'}
+        {'t': opening, 'T': opening + week - 1, 'o': '100', 'h': '101', 'l': '99', 'c': '100', 'v': '1', 'n': 24}
         for opening in range(boundary - 150 * week, boundary + week, week)
     ]
+    del candles[-3]['n']
 
     async def info(payload):
         if payload['type'] == 'candleSnapshot':
@@ -265,5 +266,7 @@ async def test_weekly_candles_include_latest_close_and_align_funding(sandbox, mo
     rows = dataset['records']
     assert len(rows) == 150
     assert rows[-1]['available_at'] == boundary
+    assert rows[-2]['trade_count'] is None
+    assert rows[-1]['trade_count'] == 24
     assert rows[-2]['funding'] == pytest.approx(.001)
     assert rows[-1]['funding'] == pytest.approx(.006)

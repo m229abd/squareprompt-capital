@@ -33,7 +33,7 @@ def step(scope,history,interval='1h',training=None,**overrides):
     for category in ORDER:state=scope['stage_'+category](history,state)
     return state
 
-@pytest.mark.parametrize('interval', ['15m','1h','4h','1d'])
+@pytest.mark.parametrize('interval', ['15m','1h','4h','1d','1w'])
 def test_retraining_uses_fourteen_elapsed_days_not_bar_count(baseline,interval):
     scope=namespace(baseline)
     period=14*86400000//INTERVAL_MS[interval]
@@ -63,7 +63,7 @@ def test_only_matured_targets_are_used_and_short_history_stays_flat(baseline):
     assert cache['rows']==36
     assert cache['last_feature_time']==frame.iloc[59]['time']
     assert cache['trained_through']==frame.iloc[63]['available_at']
-    assert len(fitted['model_artifact']['weights'])==10
+    assert len(fitted['model_artifact']['weights'])==len(fitted['model_artifact']['features'])
     assert math.isfinite(fitted['forecast'])
 
 
@@ -77,7 +77,8 @@ def test_holdout_prices_cannot_change_scaler_weights_or_hyperparameters(baseline
     second=step(after,changed,training=training)
     for field in ['weights','mean','scale']:
         np.testing.assert_array_equal(before['model_cache'][field],after['model_cache'][field])
-    assert first['model_artifact']['alpha']==second['model_artifact']['alpha']
+    for field in ['alpha','forecast_gain','normalized_error']:
+        assert first['model_artifact'][field]==second['model_artifact'][field]
     step(before,frame.iloc[:950],training=training)
     assert len(before['model_cache']['events'])==1
     assert before['model_cache']['trained_through']==int(training['available_at'].iloc[-1])
@@ -90,11 +91,54 @@ def test_cost_band_sizing_and_drawdown_breaker(baseline):
     assert scope['stage_signals'](history,copy.deepcopy(signal))['target']==1
     expensive=copy.deepcopy(signal);expensive['execution_costs']['taker_rate']=.01
     assert scope['stage_signals'](history,expensive)['target']==0
+    weak={**signal,'forecast':.0005}
+    assert scope['stage_signals'](history,weak.copy())['target']==0
+    held=scope['stage_signals'](history,{**weak,'previous_position':.1})
+    assert scope['stage_sizing'](history,{**held,'volatility':.01})['target']==.1
+    assert scope['stage_signals'](history,{**weak,'previous_position':-.1})['target']==0
     assert abs(state['target'])<=.8
     state.update(drawdown=.16,target=1.)
     assert scope['stage_risk'](history,state)['target']==0
     state.update(drawdown=0.,target=1.)
     assert scope['stage_risk'](history,state)['target']==0
+
+
+def test_liquidity_and_market_factor_cap_exposure_with_missing_data_fallback(baseline):
+    scope=namespace(baseline)
+    _,dataset=data()
+    history=pd.DataFrame(dataset['records'][:64])
+    history['trade_count']=100
+    history.loc[history.index[-1],'trade_count']=25
+    context={'market':'BTC','cross_asset':{'ETH':history},'capital':10000.0}
+    sourced=scope['stage_sources'](history,context.copy())
+    assert sourced['activity_ratio']==.25
+    assert sourced['market_beta']==pytest.approx(1.0)
+    sized=scope['stage_sizing'](history,{**sourced,'target':1.0,'volatility':.001})
+    normal=scope['stage_sizing'](history,{**sourced,'target':1.0,'volatility':.001,'activity_ratio':1.0})
+    assert sized['target']<normal['target']
+    hedged=scope['stage_exposure'](history,{**sized,'factor_impulse':-2.0})
+    assert 0<hedged['target']<sized['target']
+    assert scope['stage_exposure'](history,{**sized,'factor_impulse':2.0})['target']==sized['target']
+    stale=scope['stage_sources'](history.drop(columns=['trade_count']),{**context,'cross_asset':{'ETH':history.iloc[:-1]}})
+    assert stale['market_beta']==0
+    assert math.isfinite(stale['activity_ratio'])
+    carry={**sourced,'observed_funding_hourly':.001,'forecast_uncertainty':.01,'volatility':.001}
+    long=scope['stage_sizing'](history,{**carry,'target':1.0})
+    short=scope['stage_sizing'](history,{**carry,'target':-1.0})
+    assert 0<long['target']<abs(short['target'])
+
+
+def test_session_loss_latches_until_next_session(baseline):
+    scope=namespace(baseline)
+    _,dataset=data()
+    history=pd.DataFrame(dataset['records'][:64])
+    session=int(history['available_at'].iloc[-1])//86400000*86400000
+    initial={'drawdown':0.0,'capital':10000.0,'as_of':session,'target':.1}
+    risk=scope['stage_risk']
+    assert risk(history,initial.copy())['target']>0
+    assert risk(history,{**initial,'capital':9700.0})['target']==0
+    assert risk(history,{**initial,'capital':9900.0})['target']==0
+    assert risk(history,{**initial,'capital':9900.0,'as_of':session+86400000})['target']>0
 
 
 @pytest.mark.asyncio
@@ -109,7 +153,8 @@ async def test_real_kernel_exports_fit_artifact_and_scores_full_holdout(baseline
     artifact=result['models'][0]
     assert artifact['trained_through']==datasets[0]['training_cutoff']
     assert artifact['rows']>32
-    assert len(artifact['weights'])==len(artifact['features'])==10
+    assert len(artifact['weights'])==len(artifact['features'])==12
+    assert 0<=artifact['forecast_gain']<=1
     assert all(math.isfinite(v) for v in result['metrics'].values())
     outputs=result['notebook']['cells'][-1]['outputs']
     assert any('models' in o.get('data',{}).get('application/json',{}) for o in outputs)

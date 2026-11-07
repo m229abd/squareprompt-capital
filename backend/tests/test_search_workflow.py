@@ -128,5 +128,5 @@ def test_comment_only_patch_does_not_change_executable_code(baseline):
     cell=next(c for c in baseline['cells'] if c['id']=='signals')
     annotated=notebooks.apply_patch(baseline,{'cells':{'signals':'# Updated heading\n'+notebooks.source(cell)}},'signals')
     assert not notebooks.code_changed(baseline,annotated)
-    edited=notebooks.apply_patch(baseline,{'cells':{'signals':notebooks.source(cell).replace('0.10 * state.get','0.20 * state.get')}},'signals')
+    edited=notebooks.apply_patch(baseline,{'cells':{'signals':notebooks.source(cell)+'\nentry_scale = 0.2\n'}},'signals')
     assert notebooks.code_changed(baseline,edited)

@@ -100,7 +100,9 @@ async def candles(market,cfg,end_ms):
     if row:
         return json.loads(row['body'])
     data=await info(body)
-    records=sorted([{'time':int(r['t']),'available_at':int(r['T'])+1,'open':float(r['o']),'close':float(r['c']),'high':float(r['h']),'low':float(r['l']),'volume':float(r['v'])} for r in data if int(r['T']) < closed_before],key=lambda x:x['time'])
+    records=sorted([{'time':int(r['t']),'available_at':int(r['T'])+1,'open':float(r['o']),'close':float(r['c']),'high':float(r['h']),'low':float(r['l']),'volume':float(r['v']),
+                     'trade_count':int(r['n']) if r.get('n') is not None else None}
+                    for r in data if int(r['T']) < closed_before],key=lambda x:x['time'])
     if len(records)<cfg['bars']:
         raise ValueError(f"{market['id']}: only {len(records)} closed bars available, need {cfg['bars']}; choose a shorter history.")
     records=records[-cfg['bars']:]
@@ -221,7 +223,7 @@ async def execution_snapshot(config):
                 rows.append({'market':m['id'],'instrument':m['type'],'taker_rate':fee['taker_rate'],'fee_details':fee,'funding_rate_hourly':funding,'spread_bps':2*(ask-bid)/(ask+bid)*10000,'half_spread_rate':(ask-bid)/(ask+bid),'bid':bid,'ask':ask,'source':'Hyperliquid userFees / asset context / l2Book','fetched_at':time.time()})
             except (ValueError,KeyError,IndexError,httpx.HTTPError) as exc:
                 rows.append({'market':m['id'],'error':str(exc),'fetched_at':time.time()})
-    snapshot={'id':uuid.uuid4().hex,'created_at':time.time(),'mode':config['mode'],'market_type':config['market_type'],'wallet_address':config.get('wallet_address',''),'markets':config['markets'],'quotes':rows,'funding_policy':'Current hourly funding rate held constant; historical funding remains provenance data.'}
+    snapshot={'id':uuid.uuid4().hex,'created_at':time.time(),'mode':config['mode'],'market_type':config['market_type'],'wallet_address':config.get('wallet_address',''),'markets':config['markets'],'quotes':rows,'funding_policy':'Replay charges the frozen hourly funding rate. Historical funding is available to the strategy.'}
     with store.connect() as db:db.execute('INSERT INTO cache VALUES(?,?)',('execution:'+snapshot['id'],json.dumps(snapshot)))
     return snapshot
 
